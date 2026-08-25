@@ -68,9 +68,11 @@ class ResBlock(nn.Module):
 
 
 class FastGenerator(nn.Module):
-    def __init__(self, in_ch=3, out_ch=3, ngf=64, n_blocks=9, residual=True):
+    def __init__(self, in_ch=3, out_ch=3, ngf=64, n_blocks=9, residual=True,
+                 trunk=None):
         super().__init__()
         self.residual = residual
+        trunk = trunk or ngf * 4   # width of the residual-block stream
 
         def norm(c):
             return nn.InstanceNorm2d(c, affine=False, track_running_stats=False)
@@ -83,13 +85,13 @@ class FastGenerator(nn.Module):
             nn.Conv2d(ngf, ngf * 2, kernel_size=3, stride=2, padding=1, bias=True),
             norm(ngf * 2),
             nn.ReLU(True),
-            nn.Conv2d(ngf * 2, ngf * 4, kernel_size=3, stride=2, padding=1, bias=True),
-            norm(ngf * 4),
+            nn.Conv2d(ngf * 2, trunk, kernel_size=3, stride=2, padding=1, bias=True),
+            norm(trunk),
             nn.ReLU(True),
         ]
-        layers += [ResBlock(ngf * 4) for _ in range(n_blocks)]
+        layers += [ResBlock(trunk) for _ in range(n_blocks)]
         layers += [
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=3, stride=2,
+            nn.ConvTranspose2d(trunk, ngf * 2, kernel_size=3, stride=2,
                                padding=1, output_padding=1, bias=True),
             norm(ngf * 2),
             nn.ReLU(True),

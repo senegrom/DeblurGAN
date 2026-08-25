@@ -105,24 +105,105 @@ A real grayscale speedup would require retraining a slimmer generator (e.g.
 `--ngf 32`: ~4x fewer FLOPs) on grayscale pairs — a training job, not an
 inference switch.
 
-## FP8 / FP4
+## FP8 (tested via the TensorRT port) / FP4
 
-Not viable in stock PyTorch for this model, and not implemented:
+Stock PyTorch cannot run this model in FP8: its FP8 (`float8_e4m3fn`,
+`torch._scaled_mm`) and the torchao FP8/FP4 (NVFP4) paths only cover
+**matmuls / nn.Linear**, and this generator is 100% convolutions — there are
+no FP8/FP4 conv kernels in the cuDNN bindings (verified in torch 2.13).
 
-- PyTorch's FP8 (`float8_e4m3fn`/`e5m2`, `torch._scaled_mm`) and the torchao
-  FP8/FP4 (NVFP4) paths only cover **matmuls / nn.Linear** — this generator is
-  100% convolutions; there are no FP8/FP4 conv kernels exposed by
-  PyTorch/cuDNN bindings (checked torch 2.13: no
-  `cudnn.conv.fp16_accumulate`, no fp8 conv op either).
-- Even if kernels existed, the win over FP16 would be limited: at 1080p the
-  net is already partly memory/norm-bound (~26 effective TFLOPS of the card's
-  ~88 FP16 TFLOPS), and per-tensor-scaled FP8 on a GAN generator with
-  instance-norm statistics is exactly the kind of place where activations
-  overflow the ~448 dynamic range of E4M3 without per-layer calibration.
-- The practical route to lower precision here is **TensorRT**: export ONNX
-  (`torch.onnx.export` works on this static graph) and build an INT8- or
-  FP8-calibrated engine. Expect maybe another ~1.5x over FP16 at 1080p, at
-  the cost of a calibration pass and a second runtime to maintain.
+The working "port" is **TensorRT 11 + NVIDIA ModelOpt**, executed end-to-end
+here: `torch.onnx.export` -> `modelopt.onnx.quantization --quantize_mode fp8`
+(entropy calibration on the example frames; TRT 11 is strongly typed, so
+precision comes from the ONNX dtypes/Q-DQ nodes, the old FP16/FP8 builder
+flags are gone). Measured:
+
+| engine @1280x720 | ms/img | PSNR vs PyTorch fp32 |
+|---|---|---|
+| TensorRT fp16          | 13.7 | 66.4 dB |
+| TensorRT fp8 (ModelOpt PTQ) | 12.7 | 58.5 dB |
+| (torch.compile fp16, for reference) | 15.0 | 66.2 dB |
+
+TensorRT fp16 at 1080p: 32.4 ms — a dead heat with torch.compile (31.9 ms).
+
+**Verdict: FP8 buys ~7% here.** The net is InstanceNorm/memory-bound, not
+conv-math-bound (~26 effective TFLOPS of the card's ~88 FP16 TFLOPS), so
+halving tensor-core math barely moves end-to-end time; the norms and
+activations stay fp16 either way. Quality is fine (58.5 dB is invisible after
+uint8), but a second runtime + quantization toolchain for 7% is not worth it —
+`--compile` in PyTorch reaches the same place. FP4 (NVFP4) is weight-only /
+Linear-focused for LLMs and has no conv path at all.
+
+Toolchain note (Windows/py3.14): `pip install tensorrt nvidia-modelopt` plus
+manual extras `onnx-graphsurgeon onnxslim onnxscript onnxruntime polygraphy
+lief` (the `nvidia-modelopt[onnx]` extra pins `onnxruntime-gpu==1.22` which
+has no py3.14 wheel — CPU onnxruntime calibrates fine, ~7 min for this model).
+
+## Channel pruning / merging: measured, not viable without retraining
+
+"Merge some channels through the whole network" was tested directly
+(`experiments/prune_probe.py`): the trunk's 256-channel residual stream is shared by all
+9 blocks (the residual adds force one consistent channel set), so slimming
+means keeping the same top-K channels in down-conv out, every block conv
+in+out, and up-conv in. Ranked by activation importance on real frames and
+sliced the checkpoint:
+
+| trunk width kept | PSNR vs full model | fp16 1080p ms (eager) |
+|---|---|---|
+| 256 (full) | ref | 74² |
+| 224 (-12.5%) | 21.0-22.9 dB | 71 |
+| 192 (-25%)  | 17.3-17.4 dB | 59 |
+| 128 (-50%)  | 19.2 dB | 50 |
+
+² eager fp16 run-to-run variance vs the table above; relative scaling is the point.
+
+Dropout(0.5) training made every channel load-bearing: importance is nearly
+uniform (min 1.35 / median 1.78 / max 2.07 mean-|activation|), only 3 channel
+pairs correlate above |rho|=0.95, and dropping even the 32 least important
+channels falls to ~21 dB — clearly visible artifacts. There is aggregate
+linear redundancy (100/256 dimensions explain 95% of stream variance), but
+exploiting it needs a learned re-projection (low-rank factorization) plus
+finetuning — same story for grayscale: the honest route to a big win is
+**distilling a slim student** (e.g. `FastGenerator(ngf=32)` or `trunk=128`,
+1-channel in/out) on your training pairs with the current model as teacher;
+roughly 4x fewer FLOPs, a few hours of training on this GPU.
+
+## Quality reality check (why outputs look only mildly deblurred)
+
+The inference path is verified correct — bit-identical to the repo's own
+network (equivalence test: max abs diff 0.0) and the residual orientation was
+confirmed empirically (`--no-residual` yields the tell-tale gray residual
+map). What limits the results is the **checkpoint itself**:
+`checkpoints/experiment_name/latest_net_G.pth` comes from this fork's
+training setup — one-conv ResnetBlocks (half the paper's generator capacity),
+vanilla GAN loss instead of the paper's WGAN-GP, and only a `latest` snapshot
+exists (epoch snapshots would appear every 5 epochs), i.e. a very young run.
+The demo GIFs' second frames show what the *official* paper model produces on
+these exact inputs — far sharper. Retraining longer would help some, but see
+the model-landscape note below before spending GPU-days on a 2017
+architecture.
+
+## Better models available (researched Aug 2026)
+
+GoPro-benchmark reference: original DeblurGAN ~28.7 dB, DeblurGAN-v2 29.55.
+Ready-to-use upgrades, all loadable on this exact venv (PyTorch 2.13) via
+`pip install spandrel` (chaiNNer's MIT model loader) or their own repos:
+
+| model | GoPro PSNR | speed class on this GPU | license / weights |
+|---|---|---|---|
+| [NAFNet-w64](https://github.com/megvii-research/NAFNet) (2022, CNN) | 33.71 dB | ~0.15-0.4 s per 1080p frame (w32: near-real-time at 32.87 dB) | MIT, Google Drive |
+| [FFTformer](https://github.com/kkkls/FFTformer) (2023, transformer) | 34.21 dB | ~2-3 s per 1080p frame | MIT, weights in repo |
+| [MIMO-UNet+](https://github.com/chosj95/MIMO-UNet) (2021, CNN) | 32.45 dB | ~40 ms per 1080p frame (video-rate) | no license file; weights on Drive |
+| [EVSSM](https://github.com/kkkls/EVSSM) (2025, Mamba) | 34.51 dB | fast, but needs WSL2 (no Windows wheels for mamba-ssm) | MIT |
+| [AdaRevD-L](https://github.com/INVOKERer/AdaRevD) (2024) | 34.60 dB | seconds/frame, research code | non-commercial |
+
+**Practical verdict:** a downloaded NAFNet-w64 beats anything a retrained
+original DeblurGAN can reach by ~4-5 dB with zero training (MIMO-UNet+ if you
+need video-rate; FFTformer for max easy quality). For real handheld photos
+(not GoPro-style blur), prefer RealBlur-trained checkpoints (FFTformer ships
+one; MLWNet is the RealBlur champion). Nothing diffusion-based is
+ready-to-use yet as of Aug 2026. This repo remains useful as a fast,
+self-contained baseline — not as the quality frontier.
 
 ## Also noticed while reading the code (not changed)
 

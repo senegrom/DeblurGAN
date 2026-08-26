@@ -49,15 +49,27 @@ IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.webp', '.tif', '.ti
 LUMA = (0.299, 0.587, 0.114)
 
 _REPO = os.path.dirname(os.path.abspath(__file__))
-# Prefer the recovered official (two-conv) weights; fall back to the
-# in-repo checkpoint (trained on the one-conv ResnetBlock bug, much weaker).
-_OFFICIAL = os.path.join(_REPO, 'checkpoints', 'official', 'latest_net_G.pth')
+
+
+def _first_existing(*paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return paths[-1]
+
+
+# deblurgan: prefer the recovered official (two-conv) weights over the
+# upstream checkpoint (trained on the one-conv ResnetBlock bug, much weaker).
+# student: prefer the NAFNet-distilled variant (29.29 dB) over GT-trained.
 DEFAULT_CKPT = {
-    'deblurgan': (_OFFICIAL if os.path.exists(_OFFICIAL) else
-                  os.path.join(_REPO, 'checkpoints', 'experiment_name',
-                               'latest_net_G.pth')),
+    'deblurgan': _first_existing(
+        os.path.join(_REPO, 'checkpoints', 'official', 'latest_net_G.pth'),
+        os.path.join(_REPO, 'checkpoints', 'experiment_name', 'latest_net_G.pth')),
     'nafnet': os.path.join(_REPO, 'checkpoints', 'NAFNet-GoPro-width64.pth'),
-    'student': os.path.join(_REPO, 'checkpoints', 'student', 'student_latest.pth'),
+    'student': _first_existing(
+        os.path.join(_REPO, 'checkpoints', 'student_nafnet', 'student_best.pth'),
+        os.path.join(_REPO, 'checkpoints', 'student', 'student_best.pth'),
+        os.path.join(_REPO, 'checkpoints', 'student', 'student_latest.pth')),
 }
 
 

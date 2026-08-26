@@ -6,6 +6,15 @@ Pytorch implementation of the paper DeblurGAN: Blind Motion Deblurring Using Con
 Our network takes blurry image as an input and procude the corresponding sharp estimate, as in the example:
 <img src="images/animation3.gif" width="400px"/> <img src="images/animation4.gif" width="400px"/>
 
+The original 1280x720 GoPro test-set frames behind these GIF demos, without
+GIF palette and scaling artifacts, are in [`examples/gopro`](examples/gopro/):
+
+- `animation3.gif`: `GOPR0881_11_01-000210`
+- `animation4.gif`: `GOPR0869_11_00-000034`
+
+Each ID has the original blurred frame under `input/` and its paired sharp
+ground truth under `target/`.
+
 
 The model we use is Conditional Wasserstein GAN with Gradient Penalty + Perceptual loss based on VGG-19 activations. Such architecture also gives good results on other image-to-image translation problems (super resolution, colorization, inpainting, dehazing etc.)
 

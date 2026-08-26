@@ -19,15 +19,16 @@ measured-fastest eager settings; add `--compile` for large same-size batches.
 
 ## Example job
 
-Deblur the bundled example images (first frames of the demo GIFs, in
-`examples/blurry/`) with the shipped checkpoint:
+Deblur the original full-resolution GoPro test frames used by the demo GIFs:
 
 ```powershell
-D:\PyEnv\torch\Scripts\python.exe deblur_fast.py --input examples\blurry --output examples\deblurred
+D:\PyEnv\torch\Scripts\python.exe deblur_fast.py --input examples\gopro\input --output examples\gopro\deblurred
 ```
 
-Committed reference outputs are in `examples/deblurred/`. A realistic bulk job
-— a folder of same-size frames, batched, compiled, saved as JPEG:
+Their paired sharp ground truth is in `examples/gopro/target/`. The older
+640x360 GIF-extracted inputs and committed reference outputs remain in
+`examples/blurry/` and `examples/deblurred/` for comparison. A realistic bulk
+job -- a folder of same-size frames, batched, compiled, saved as JPEG:
 
 ```powershell
 D:\PyEnv\torch\Scripts\python.exe deblur_fast.py --input D:\frames --output D:\frames_deblurred --batch 4 --compile --ext jpg

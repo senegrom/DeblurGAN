@@ -28,12 +28,18 @@ ARCH_CONFIG = dict(in_ch=1, out_ch=1, ngf=32, n_blocks=9, residual=True,
 
 
 class GrayPairs(torch.utils.data.Dataset):
-    """Random same-position crops from GoPro-style input/ + target/ pairs."""
+    """Random same-position crops from GoPro-style input/ + target/ pairs.
 
-    def __init__(self, root, names, crop):
+    With teacher_sub set, also yields the teacher's output (precomputed by
+    experiments/make_teacher_labels.py) cropped identically; otherwise the
+    teacher slot repeats the ground truth.
+    """
+
+    def __init__(self, root, names, crop, teacher_sub=None):
         self.root = root
         self.names = names
         self.crop = crop
+        self.teacher_sub = teacher_sub
 
     def __len__(self):
         return len(self.names)
@@ -45,15 +51,17 @@ class GrayPairs(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         name = self.names[i]
-        blur, sharp = self._load('input', name), self._load('target', name)
+        imgs = [self._load('input', name), self._load('target', name)]
+        imgs.append(self._load(self.teacher_sub, name) if self.teacher_sub
+                    else imgs[1])
         c = self.crop
-        y = random.randint(0, blur.shape[0] - c)
-        x = random.randint(0, blur.shape[1] - c)
-        blur, sharp = blur[y:y + c, x:x + c], sharp[y:y + c, x:x + c]
+        y = random.randint(0, imgs[0].shape[0] - c)
+        x = random.randint(0, imgs[0].shape[1] - c)
+        imgs = [im[y:y + c, x:x + c] for im in imgs]
         if random.random() < 0.5:
-            blur, sharp = blur[:, ::-1], sharp[:, ::-1]
-        return (torch.from_numpy(np.ascontiguousarray(blur))[None],
-                torch.from_numpy(np.ascontiguousarray(sharp))[None])
+            imgs = [im[:, ::-1] for im in imgs]
+        return tuple(torch.from_numpy(np.ascontiguousarray(im))[None]
+                     for im in imgs)
 
 
 def charbonnier(a, b, eps=1e-3):
@@ -105,6 +113,14 @@ def main():
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--resume', action='store_true')
+    ap.add_argument('--teacher-sub', default=None,
+                    help='subdir of --data with precomputed teacher outputs '
+                         '(e.g. teacher_nafnet); enables distillation')
+    ap.add_argument('--teacher-alpha', type=float, default=1.0,
+                    help='loss weight on the teacher target; the rest goes '
+                         'to ground truth (validation always scores vs GT)')
+    ap.add_argument('--init', default=None,
+                    help='warm-start from a student checkpoint (weights only)')
     args = ap.parse_args()
 
     device = torch.device('cuda')
@@ -126,6 +142,14 @@ def main():
     net = FastGenerator(**ARCH_CONFIG).to(device).train()
     n_params = sum(p.numel() for p in net.parameters())
     log(f'student params: {n_params / 1e6:.2f}M (config {ARCH_CONFIG})')
+    if args.teacher_sub:
+        log(f'distillation: teacher targets from {args.teacher_sub}/ '
+            f'(alpha {args.teacher_alpha}), validation still scored vs GT')
+    if args.init:
+        init_sd = torch.load(args.init, map_location=device, weights_only=True)
+        net.load_state_dict(init_sd['state_dict'])
+        log(f'warm-started from {args.init} '
+            f'(iter {init_sd.get("iter", "?")}, {init_sd.get("psnr", 0):.2f} dB)')
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.9),
                             weight_decay=1e-4)
@@ -143,7 +167,8 @@ def main():
         start_iter, best_psnr = st['iter'], st['best_psnr']
         log(f'resumed from iter {start_iter} (best {best_psnr:.2f} dB)')
 
-    ds = GrayPairs(args.data, train_names, args.crop)
+    ds = GrayPairs(args.data, train_names, args.crop,
+                   teacher_sub=args.teacher_sub)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
         pin_memory=True, drop_last=True, persistent_workers=True)
@@ -156,8 +181,12 @@ def main():
     it = start_iter
     t0 = time.time()
     loss_acc, n_acc = 0.0, 0
+    def crit(pred, target):
+        return charbonnier(pred, target) + 0.05 * fft_l1(pred, target)
+
+    alpha = args.teacher_alpha if args.teacher_sub else 0.0
     while it < args.iters:
-        for blur, sharp in loader:
+        for blur, sharp, teach in loader:
             if it >= args.iters:
                 break
             blur = blur.to(device, non_blocking=True)
@@ -165,7 +194,13 @@ def main():
             with torch.autocast('cuda', dtype=torch.bfloat16):
                 pred = net(blur)
             pred = pred.float()
-            loss = charbonnier(pred, sharp) + 0.05 * fft_l1(pred, sharp)
+            if alpha > 0:
+                teach = teach.to(device, non_blocking=True)
+                loss = alpha * crit(pred, teach)
+                if alpha < 1:
+                    loss = loss + (1 - alpha) * crit(pred, sharp)
+            else:
+                loss = crit(pred, sharp)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()

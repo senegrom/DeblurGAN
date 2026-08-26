@@ -70,7 +70,15 @@ def main():
              f'({torch.cuda.get_device_name(0)}, torch {torch.__version__})', '']
 
     official_ck = os.path.join(REPO, 'checkpoints', 'official', 'latest_net_G.pth')
-    student_ck = os.path.join(REPO, 'checkpoints', 'student', 'student_best.pth')
+    student_cks = []          # every student-container checkpoint that exists
+    for label, p in (
+            ('student GT-trained', os.path.join(REPO, 'checkpoints', 'student',
+                                                'student_best.pth')),
+            ('student NAFNet-distilled', os.path.join(REPO, 'checkpoints',
+                                                      'student_nafnet',
+                                                      'student_best.pth'))):
+        if os.path.exists(p):
+            student_cks.append((label, p))
 
     # ---------------- quality: full GoPro test set --------------------------
     with open(os.path.join(args.data, 'input.lmdb', 'meta_info.txt')) as f:
@@ -84,14 +92,15 @@ def main():
 
     official, _ = load_generator(official_ck, dev, precision='fp16')
     naf, naf_ac, naf_mult = load_nafnet(DEFAULT_CKPT['nafnet'], dev, 'fp16')
-    stu, stu_dtype, stu_cfg = load_student(student_ck, dev, precision='fp16')
-    stu_iter = torch.load(student_ck, map_location='cpu',
-                          weights_only=True).get('iter', '?')
+    students = []
+    for label, p in student_cks:
+        net, dt, cfg = load_student(p, dev, precision='fp16')
+        it = torch.load(p, map_location='cpu', weights_only=True).get('iter', '?')
+        students.append((f'{label}@{it} (gray)', net, dt))
 
     sums = {'input (RGB)': 0.0, 'official DeblurGAN (RGB)': 0.0,
-            'NAFNet-w64 (RGB)': 0.0, 'input (gray)': 0.0,
-            f'student@{stu_iter} (gray)': 0.0}
-    skey = f'student@{stu_iter} (gray)'
+            'NAFNet-w64 (RGB)': 0.0, 'input (gray)': 0.0}
+    sums.update({label: 0.0 for label, _, _ in students})
     with torch.inference_mode():
         for i, key in enumerate(keys):
             x = get(env_in, key, dev)
@@ -109,9 +118,10 @@ def main():
 
             xg, gtg = luma(x), luma(gt)
             sums['input (gray)'] += psnr8(xg, gtg)
-            xp, h, w = pad_to_multiple((xg * 2 - 1).to(stu_dtype), 4)
-            y = stu(xp)[:, :, :h, :w]
-            sums[skey] += psnr8((y.float() + 1) / 2, gtg)
+            for label, stu, dt in students:
+                xp, h, w = pad_to_multiple((xg * 2 - 1).to(dt), 4)
+                y = stu(xp)[:, :, :h, :w]
+                sums[label] += psnr8((y.float() + 1) / 2, gtg)
 
             if (i + 1) % 200 == 0:
                 print(f'{i + 1}/{len(keys)}', flush=True)
@@ -122,7 +132,10 @@ def main():
     for k, v in sums.items():
         lines.append(f'| {k} | {v / n:.2f} dB |')
     lines.append('')
-    print('\n'.join(lines[-8:]), flush=True)
+    print('\n'.join(lines[-(len(sums) + 4):]), flush=True)
+
+    del official, naf, students
+    torch.cuda.empty_cache()
 
     # ---------------- speed --------------------------------------------------
     lines += ['## Speed (batch 1, ms/img; eager then torch.compile)', '',
@@ -167,11 +180,15 @@ def main():
         run_naf, 16, dtype=torch.float32))
     print('speed: nafnet done', flush=True)
 
-    lines.append(speed_row(
-        'student fp16 (gray)',
-        lambda: load_student(student_ck, dev, precision='fp16')[0],
-        lambda n_, t: n_(t), 4, in_ch=stu_cfg.get('in_ch', 1)))
-    print('speed: student done', flush=True)
+    if student_cks:
+        first_ck = student_cks[0][1]
+        first_cfg = torch.load(first_ck, map_location='cpu',
+                               weights_only=True)['arch_config']
+        lines.append(speed_row(
+            'student fp16 (gray)',
+            lambda: load_student(first_ck, dev, precision='fp16')[0],
+            lambda n_, t: n_(t), 4, in_ch=first_cfg.get('in_ch', 1)))
+        print('speed: student done', flush=True)
 
     text = '\n'.join(lines) + '\n'
     os.makedirs(os.path.dirname(args.out), exist_ok=True)

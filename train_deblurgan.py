@@ -261,7 +261,7 @@ def main():
         acc['g'] += lossG.item()
         acc['d'] += lossD.item()
         acc['content'] += content.item()
-        acc['pixel'] += float(pixel)
+        acc['pixel'] += float(pixel.detach())
         n_acc += 1
         it += 1
 

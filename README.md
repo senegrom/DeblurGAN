@@ -32,9 +32,11 @@ README are dead; this copy was recovered in Aug 2026 from a 2018 fork
 2018-11-12 while the official link was still live) and verified against the
 key layout reported in
 [upstream issue #145](https://github.com/KupynOrest/DeblurGAN/issues/145).
-`deblur_fast.py` uses them by default. Note: the checkpoint at
-`checkpoints/experiment_name/` (inherited from upstream) was trained on a
-buggy one-conv ResnetBlock and barely deblurs — see SPEED.md.
+`deblur_fast.py` uses them by default. Note: the checkpoint upstream ships at
+`checkpoints/experiment_name/` was trained on a buggy one-conv ResnetBlock,
+barely deblurs (below the blurry-input baseline on the GoPro test average),
+and has been **removed from this fork** so nobody uses it by accident — see
+SPEED.md.
 To test a model put your blurry images into a folder and run:
 ```bash
 python test.py --dataroot /.path_to_your_data --model test --dataset_mode single --learn_residual

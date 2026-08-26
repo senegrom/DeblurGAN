@@ -1,9 +1,15 @@
 # DeblurGAN inference speedups
 
 Measured on RTX 5070 Ti (16 GB, Blackwell sm_120), PyTorch 2.13.0+cu130,
-Python 3.14, venv `D:\PyEnv\torch`, checkpoint
-`checkpoints/experiment_name/latest_net_G.pth` (resnet_9blocks, instance norm,
-learn_residual).
+Python 3.14, venv `D:\PyEnv\torch`.
+
+Note on the benchmark tables below: they were measured with the legacy
+one-conv checkpoint (`checkpoints/experiment_name/`, since **removed from
+this fork** — it barely deblurred; upstream still carries it). The default is
+now the recovered official generator (`checkpoints/official/`), whose blocks
+have two convs — roughly double the trunk compute — so expect its wall-clock
+to be ~1.5-1.8x these numbers until re-measured. All pipeline-level findings
+(fp16, compile, channels_last, gray, FP8) carry over unchanged.
 
 ## TL;DR
 

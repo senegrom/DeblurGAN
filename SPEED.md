@@ -3,13 +3,27 @@
 Measured on RTX 5070 Ti (16 GB, Blackwell sm_120), PyTorch 2.13.0+cu130,
 Python 3.14, venv `D:\PyEnv\torch`.
 
-Note on the benchmark tables below: they were measured with the legacy
-one-conv checkpoint (`checkpoints/experiment_name/`, since **removed from
-this fork** — it barely deblurred; upstream still carries it). The default is
-now the recovered official generator (`checkpoints/official/`), whose blocks
-have two convs — roughly double the trunk compute — so expect its wall-clock
-to be ~1.5-1.8x these numbers until re-measured. All pipeline-level findings
-(fp16, compile, channels_last, gray, FP8) carry over unchanged.
+## Current models: measured results (2026-08-26, `experiments/benchmark_all.py`)
+
+Quality on the **full GoPro test set (1111 images)** and speed on an idle GPU:
+
+| model | avg PSNR | 720p ms (compiled) | 1080p ms (compiled) |
+|---|---|---|---|
+| blurry input (RGB / gray baseline) | 25.64 / 25.69 dB | — | — |
+| official DeblurGAN, recovered (11.4M, RGB) | 27.30 dB | 33.4 (19.6) | 81.2 (45.9) |
+| **student GT-trained (2.84M, grayscale)** | **29.07 dB**¹ | 13.0 (**6.6**) | 32.6 (**14.5**) |
+| NAFNet-w64 (68M, RGB, autocast-fp16) | 33.08 dB | 123.8 (42.5) | 327.4 (102.2) |
+
+¹ grayscale PSNR vs the 25.69 dB gray baseline: +3.38 dB, double the official
+model's +1.66 — at 69 fps/1080p compiled, real-time. A NAFNet-distilled
+student variant is training; its numbers land here when done.
+
+Note on the historical benchmark tables further below: they were measured
+with the legacy one-conv checkpoint (`checkpoints/experiment_name/`, since
+**removed from this fork** — it barely deblurred; upstream still carries it).
+The recovered official generator has two convs per block, hence the higher
+times in the table above. All pipeline-level findings (fp16, compile,
+channels_last, gray, FP8) carry over unchanged.
 
 ## TL;DR
 
@@ -213,19 +227,19 @@ the issue-#145 key layout. It is now committed here as
 block-layout auto-detection with no code changes, and is the default
 `--arch deblurgan` checkpoint.
 
-GoPro test set, average RGB-PSNR measured here (first 800 of 1111 images —
-the run was stopped early; the ranking was stable throughout):
+GoPro test set, average RGB-PSNR (full 1111 images; the buggy-checkpoint row
+is from an 800-image run made before that checkpoint was deleted):
 
 | model | PSNR |
 |---|---|
-| blurry input (baseline) | 26.09 dB |
-| repo (buggy one-conv) checkpoint | 25.30 dB — *worse than the input* |
-| **official recovered weights** | **27.66 dB** |
-| NAFNet-w64 | 32.95 dB |
+| blurry input (baseline) | 25.64 dB |
+| repo (buggy one-conv) checkpoint, now deleted | ~25.3 dB — *worse than the input* |
+| **official recovered weights** | **27.30 dB** |
+| NAFNet-w64 | 33.08 dB |
 
 (The paper reports 28.7 dB on GoPro; Y-channel vs RGB PSNR and evaluation
 details account for small offsets. Reproduce with
-`python experiments/eval_gopro_test.py --data <GoPro>/test`.)
+`python experiments/benchmark_all.py`.)
 
 On the two demo frames the recovered model produces the crisp GAN look of the
 README GIFs (the shipped checkpoint's output is nearly indistinguishable from
@@ -242,10 +256,15 @@ optional Charbonnier anchor), bf16 autocast, on the GoPro pairs at
 `D:/Photos/TrainingData/GoPro/train`. Expect roughly a day of GPU time for
 100k iterations with the WGAN-GP 5:1 critic schedule.
 
-`train_student.py` (running as of this writing) distills a slim grayscale
-student — `FastGenerator(in_ch=1, out_ch=1, ngf=32, trunk=128)`, 2.84M params,
-43 ms/1080p eager fp16 — supervised on the same pairs; checkpoints land in
-`checkpoints/student/` and load with `--arch student`.
+`train_student.py` trains the slim grayscale student —
+`FastGenerator(in_ch=1, out_ch=1, ngf=32, trunk=128)`, 2.84M params. The
+GT-supervised run (100k iters, ~7h wall at Idle priority) reached **29.07 dB
+on the full GoPro test** at 14.5 ms/1080p compiled — see the results table at
+the top. Checkpoints land in `checkpoints/student/` and load with
+`--arch student`. Distillation mode: precompute teacher labels with
+`experiments/make_teacher_labels.py`, then `--teacher-sub teacher_nafnet
+--init checkpoints/student/student_best.pth` trains against NAFNet outputs
+(`--teacher-alpha` blends teacher vs GT; validation always scores vs GT).
 
 ## Better models available (researched Aug 2026)
 

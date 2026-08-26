@@ -37,6 +37,11 @@ key layout reported in
 barely deblurs (below the blurry-input baseline on the GoPro test average),
 and has been **removed from this fork** so nobody uses it by accident — see
 SPEED.md.
+
+Measured on the full GoPro test set (details and speed numbers in
+[SPEED.md](SPEED.md)): blurry input 25.6 dB, official DeblurGAN 27.3 dB,
+this fork's 2.84M grayscale student 29.1 dB (gray, real-time at 1080p),
+NAFNet-w64 33.1 dB via `--arch nafnet`.
 To test a model put your blurry images into a folder and run:
 ```bash
 python test.py --dataroot /.path_to_your_data --model test --dataset_mode single --learn_residual

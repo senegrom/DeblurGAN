@@ -184,6 +184,63 @@ these exact inputs — far sharper. Retraining longer would help some, but see
 the model-landscape note below before spending GPU-days on a 2017
 architecture.
 
+## The official pretrained weights: lost, hunted down, recovered
+
+The README's Google Drive weights link is dead (the file is deleted — 404 on
+its metadata page, not a quota block) and so is the pre-2018 Dropbox link
+found in git history. Upstream issue #145 preserves the fingerprint of the
+official file: two convs per ResnetBlock (`conv_block.1` + `conv_block.6`
+keys) — the *paper* architecture, which the shipped 24.3 MB checkpoint
+(byte-identical to upstream's committed one, blob `d2be26f9…`) does not have:
+that one was trained after an operator-precedence bug collapsed every block
+to a single conv, and it barely deblurs (see numbers below). A community
+retrain shared in issue #230 (Sept 2023) uses the same buggy architecture and
+is equally weak (measured 20.4/22.2 dB on the example frames).
+
+The recovery: scanning all 531 forks of the upstream repo for committed
+checkpoints whose size differs from the buggy 24,307,244 bytes turned up
+exactly one hit — `haozhe15/DeblurGAN`, forked 2018-11-12 with a same-day
+commit "download weights": a 45,565,607-byte `latest_net_G.pth`, matching the
+expected ~45.6 MB of the true 11.39M-param two-conv generator, with exactly
+the issue-#145 key layout. It is now committed here as
+`checkpoints/official/latest_net_G.pth`, loads via `deblur_fast.py`'s
+block-layout auto-detection with no code changes, and is the default
+`--arch deblurgan` checkpoint.
+
+GoPro test set, average RGB-PSNR measured here (first 800 of 1111 images —
+the run was stopped early; the ranking was stable throughout):
+
+| model | PSNR |
+|---|---|
+| blurry input (baseline) | 26.09 dB |
+| repo (buggy one-conv) checkpoint | 25.30 dB — *worse than the input* |
+| **official recovered weights** | **27.66 dB** |
+| NAFNet-w64 | 32.95 dB |
+
+(The paper reports 28.7 dB on GoPro; Y-channel vs RGB PSNR and evaluation
+details account for small offsets. Reproduce with
+`python experiments/eval_gopro_test.py --data <GoPro>/test`.)
+
+On the two demo frames the recovered model produces the crisp GAN look of the
+README GIFs (the shipped checkpoint's output is nearly indistinguishable from
+the blurry input).
+
+## Retraining (train_deblurgan.py / train_student.py)
+
+With the official weights recovered, retraining the full model is optional —
+but fully supported now: `train_deblurgan.py` trains the paper architecture
+(fixed two-conv blocks) with the paper losses modernized (VGG19-conv3_3
+perceptual x100 with proper ImageNet normalization — the original repo fed
+[-1,1] images into VGG unnormalized — plus WGAN-GP or `--gan-type lsgan`,
+optional Charbonnier anchor), bf16 autocast, on the GoPro pairs at
+`D:/Photos/TrainingData/GoPro/train`. Expect roughly a day of GPU time for
+100k iterations with the WGAN-GP 5:1 critic schedule.
+
+`train_student.py` (running as of this writing) distills a slim grayscale
+student — `FastGenerator(in_ch=1, out_ch=1, ngf=32, trunk=128)`, 2.84M params,
+43 ms/1080p eager fp16 — supervised on the same pairs; checkpoints land in
+`checkpoints/student/` and load with `--arch student`.
+
 ## Better models available (researched Aug 2026)
 
 GoPro-benchmark reference: original DeblurGAN ~28.7 dB, DeblurGAN-v2 29.55.

@@ -24,12 +24,17 @@ The model we use is Conditional Wasserstein GAN with Gradient Penalty + Perceptu
 - NVIDIA GPU + CUDA CuDNN (CPU untested, feedback appreciated)
 - Pytorch
 
-Download weights from [Google Drive](https://drive.google.com/file/d/1liKzdjMRHZ-i5MWhC72EL7UZLNPj5_8Y/view?usp=sharing) . Note that during the inference you need to keep only Generator weights.
-
-Put the weights into 
-```bash
-/.checkpoints/experiment_name
-```
+The **official pretrained generator weights are included** in this fork at
+`checkpoints/official/latest_net_G.pth` (45.6 MB, the true two-conv paper
+architecture). The historical Google Drive / Dropbox links from the upstream
+README are dead; this copy was recovered in Aug 2026 from a 2018 fork
+([haozhe15/DeblurGAN](https://github.com/haozhe15/DeblurGAN), committed
+2018-11-12 while the official link was still live) and verified against the
+key layout reported in
+[upstream issue #145](https://github.com/KupynOrest/DeblurGAN/issues/145).
+`deblur_fast.py` uses them by default. Note: the checkpoint at
+`checkpoints/experiment_name/` (inherited from upstream) was trained on a
+buggy one-conv ResnetBlock and barely deblurs — see SPEED.md.
 To test a model put your blurry images into a folder and run:
 ```bash
 python test.py --dataroot /.path_to_your_data --model test --dataset_mode single --learn_residual

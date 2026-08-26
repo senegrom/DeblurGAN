@@ -6,3 +6,4 @@
 *.pth
 *.html
 !examples/**/*.png
+!checkpoints/official/*.pth

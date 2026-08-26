@@ -1,26 +1,33 @@
-"""Fast DeblurGAN inference.
+"""Fast deblurring inference (DeblurGAN generator or NAFNet).
 
-Standalone, modern-PyTorch replacement for the test.py pipeline. Loads the
-generator weights trained by this repo (resnet_9blocks, instance norm) and runs
-them at full image resolution with:
+Standalone, modern-PyTorch replacement for the test.py pipeline with:
 
   * FP16 (default on CUDA) / BF16 / FP32 precision
   * cuDNN autotune, inference_mode
   * multi-worker prefetching + pinned memory + async H2D copies
   * threaded image encoding so PNG/JPEG writes overlap GPU compute
   * size-bucketed batching (same-size images run as one batch)
-  * optional --gray mode (1-channel input, folded first conv, luma output)
+  * optional --gray mode (grayscale in/out)
   * optional --compile (torch.compile; needs Triton, falls back gracefully)
 
-Unlike test.py, this processes images at native resolution (padded to a
-multiple of 4) instead of random 256x256 crops, and it runs dropout in eval
-mode (test.py accidentally leaves dropout active at inference, which makes
-outputs stochastic and noisy).
+Architectures (--arch):
+  deblurgan  this repo's generator. Auto-detects one-conv-per-block legacy
+             checkpoints (trained before the ResnetBlock fix) as well as
+             paper-correct two-conv checkpoints, with or without dropout.
+  nafnet     NAFNet (e.g. NAFNet-GoPro-width64.pth) loaded via `spandrel`
+             (pip install spandrel). ~+5 dB over DeblurGAN on GoPro.
+  student    slim distilled FastGenerator checkpoints produced by
+             train_student.py (self-describing .pth with arch_config).
+
+Unlike test.py, this processes images at native resolution (padded to the
+network's required multiple) instead of random 256x256 crops, and it runs
+dropout in eval mode (test.py accidentally leaves dropout active at
+inference, which makes outputs stochastic and noisy).
 
 Usage:
-  python deblur_fast.py --input path/to/blurry_dir --output path/to/out
-  python deblur_fast.py --input img.jpg --output out/ --precision fp32
-  python deblur_fast.py --input dir/ --output out/ --gray --batch 4
+  python deblur_fast.py --input blurry_dir --output out_dir
+  python deblur_fast.py --arch nafnet --input blurry_dir --output out_dir
+  python deblur_fast.py --input dir/ --output out/ --gray --batch 4 --compile
 """
 
 import argparse
@@ -28,6 +35,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -40,28 +48,58 @@ IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.webp', '.tif', '.ti
 # ITU-R 601-2 luma, same coefficients PIL uses for convert('L')
 LUMA = (0.299, 0.587, 0.114)
 
+_REPO = os.path.dirname(os.path.abspath(__file__))
+# Prefer the recovered official (two-conv) weights; fall back to the
+# in-repo checkpoint (trained on the one-conv ResnetBlock bug, much weaker).
+_OFFICIAL = os.path.join(_REPO, 'checkpoints', 'official', 'latest_net_G.pth')
+DEFAULT_CKPT = {
+    'deblurgan': (_OFFICIAL if os.path.exists(_OFFICIAL) else
+                  os.path.join(_REPO, 'checkpoints', 'experiment_name',
+                               'latest_net_G.pth')),
+    'nafnet': os.path.join(_REPO, 'checkpoints', 'NAFNet-GoPro-width64.pth'),
+    'student': os.path.join(_REPO, 'checkpoints', 'student', 'student_latest.pth'),
+}
+
 
 # ---------------------------------------------------------------------------
-# Model: exact same architecture/state-dict layout as networks.ResnetGenerator
-# (including its one-conv-per-ResnetBlock quirk), minus training-only pieces.
+# DeblurGAN generator, state-dict compatible with models/networks.py
 # ---------------------------------------------------------------------------
+
+def _norm(c):
+    return nn.InstanceNorm2d(c, affine=False, track_running_stats=False)
+
 
 class ResBlock(nn.Module):
-    """Matches the trained checkpoint: pad -> conv -> IN -> ReLU, residual add.
+    """Residual block matching networks.py's ResnetBlock state-dict layout.
 
-    (networks.py's ResnetBlock builds only one conv per block due to a ternary
-    precedence bug; the shipped checkpoint is trained that way, so we replicate
-    it. The Dropout that followed ReLU is parameterless and inference-off.)
+    block_layout:
+      'legacy'       pad-conv-IN-ReLU (+residual). Produced by the pre-fix
+                     ResnetBlock (an operator-precedence bug collapsed it to a
+                     single conv); the shipped experiment_name checkpoint is
+                     this variant. Conv key: conv_block.1
+      'paper'        pad-conv-IN-ReLU-[drop]-pad-conv-IN, the two-conv block
+                     of the paper as built by the fixed ResnetBlock (dropout
+                     slot always present). Conv keys: conv_block.1 / .6
+      'paper_nodrop' same but without the dropout slot (e.g. checkpoints from
+                     other DeblurGAN forks). Conv keys: conv_block.1 / .5
     """
 
-    def __init__(self, dim):
+    def __init__(self, dim, block_layout='legacy'):
         super().__init__()
-        self.conv_block = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, bias=True),
-            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-            nn.ReLU(True),
-        )
+        first = [nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, 3, bias=True),
+                 _norm(dim), nn.ReLU(True)]
+        if block_layout == 'legacy':
+            layers = first
+        elif block_layout == 'paper':
+            layers = first + [nn.Identity(),   # inference stand-in for Dropout
+                              nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, 3, bias=True),
+                              _norm(dim)]
+        elif block_layout == 'paper_nodrop':
+            layers = first + [nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, 3, bias=True),
+                              _norm(dim)]
+        else:
+            raise ValueError(f'unknown block_layout {block_layout!r}')
+        self.conv_block = nn.Sequential(*layers)
 
     def forward(self, x):
         return x + self.conv_block(x)
@@ -69,35 +107,32 @@ class ResBlock(nn.Module):
 
 class FastGenerator(nn.Module):
     def __init__(self, in_ch=3, out_ch=3, ngf=64, n_blocks=9, residual=True,
-                 trunk=None):
+                 trunk=None, block_layout='legacy'):
         super().__init__()
         self.residual = residual
         trunk = trunk or ngf * 4   # width of the residual-block stream
 
-        def norm(c):
-            return nn.InstanceNorm2d(c, affine=False, track_running_stats=False)
-
         layers = [
             nn.ReflectionPad2d(3),
             nn.Conv2d(in_ch, ngf, kernel_size=7, bias=True),
-            norm(ngf),
+            _norm(ngf),
             nn.ReLU(True),
             nn.Conv2d(ngf, ngf * 2, kernel_size=3, stride=2, padding=1, bias=True),
-            norm(ngf * 2),
+            _norm(ngf * 2),
             nn.ReLU(True),
             nn.Conv2d(ngf * 2, trunk, kernel_size=3, stride=2, padding=1, bias=True),
-            norm(trunk),
+            _norm(trunk),
             nn.ReLU(True),
         ]
-        layers += [ResBlock(trunk) for _ in range(n_blocks)]
+        layers += [ResBlock(trunk, block_layout) for _ in range(n_blocks)]
         layers += [
             nn.ConvTranspose2d(trunk, ngf * 2, kernel_size=3, stride=2,
                                padding=1, output_padding=1, bias=True),
-            norm(ngf * 2),
+            _norm(ngf * 2),
             nn.ReLU(True),
             nn.ConvTranspose2d(ngf * 2, ngf, kernel_size=3, stride=2,
                                padding=1, output_padding=1, bias=True),
-            norm(ngf),
+            _norm(ngf),
             nn.ReLU(True),
             nn.ReflectionPad2d(3),
             nn.Conv2d(ngf, out_ch, kernel_size=7),
@@ -114,25 +149,7 @@ class FastGenerator(nn.Module):
         return y
 
 
-def load_generator(checkpoint, device, precision='fp16', gray=False,
-                   residual=True, channels_last=False, compile_model=False):
-    sd = torch.load(checkpoint, map_location='cpu', weights_only=True)
-    # Strip DataParallel prefix and InstanceNorm running stats. The original
-    # pipeline never called eval(), so it always normalized with per-instance
-    # statistics; dropping the running stats reproduces that (deterministically).
-    sd = {k.removeprefix('module.'): v for k, v in sd.items()
-          if not k.endswith(('running_mean', 'running_var', 'num_batches_tracked'))}
-
-    if gray:
-        # Fold RGB->gray into the first conv: for a replicated-gray input,
-        # sum(W_r + W_g + W_b) * g is exact.
-        w = sd['model.1.weight']
-        sd = dict(sd)
-        sd['model.1.weight'] = w.sum(dim=1, keepdim=True)
-
-    net = FastGenerator(in_ch=1 if gray else 3, residual=residual)
-    net.load_state_dict(sd, strict=True)
-
+def _finalize(net, device, precision, channels_last, compile_model):
     net.eval().requires_grad_(False)
     dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16,
              'fp32': torch.float32}[precision]
@@ -142,9 +159,70 @@ def load_generator(checkpoint, device, precision='fp16', gray=False,
     if compile_model:
         try:
             net = torch.compile(net, mode='max-autotune', dynamic=False)
-        except Exception as e:  # e.g. no Triton on Windows
+        except Exception as e:  # e.g. no Triton
             print(f'[warn] torch.compile unavailable ({e}); running eager')
     return net, dtype
+
+
+def load_generator(checkpoint, device, precision='fp16', gray=False,
+                   residual=True, channels_last=False, compile_model=False):
+    """Load a DeblurGAN generator checkpoint (any block layout)."""
+    sd = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    # Strip DataParallel prefix and InstanceNorm running stats. The original
+    # pipeline never called eval(), so it always normalized with per-instance
+    # statistics; dropping the running stats reproduces that (deterministically).
+    sd = {k.removeprefix('module.'): v for k, v in sd.items()
+          if not k.endswith(('running_mean', 'running_var', 'num_batches_tracked'))}
+
+    if 'model.10.conv_block.6.weight' in sd:
+        block_layout = 'paper'
+    elif 'model.10.conv_block.5.weight' in sd:
+        block_layout = 'paper_nodrop'
+    else:
+        block_layout = 'legacy'
+
+    if gray:
+        # Fold RGB->gray into the first conv: for a replicated-gray input,
+        # sum(W_r + W_g + W_b) * g is exact.
+        sd = dict(sd)
+        sd['model.1.weight'] = sd['model.1.weight'].sum(dim=1, keepdim=True)
+
+    net = FastGenerator(in_ch=1 if gray else 3, residual=residual,
+                        block_layout=block_layout)
+    net.load_state_dict(sd, strict=True)
+    return _finalize(net, device, precision, channels_last, compile_model)
+
+
+def load_student(checkpoint, device, precision='fp16', channels_last=False,
+                 compile_model=False):
+    """Load a distilled slim FastGenerator saved by train_student.py."""
+    raw = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    cfg = raw['arch_config']
+    net = FastGenerator(**cfg)
+    net.load_state_dict(raw['state_dict'], strict=True)
+    net, dtype = _finalize(net, device, precision, channels_last, compile_model)
+    return net, dtype, cfg
+
+
+def load_nafnet(checkpoint, device, precision='fp16', channels_last=False,
+                compile_model=False):
+    """Load a NAFNet checkpoint via spandrel. Input/output range is [0,1].
+
+    NAFNet's LayerNorms are numerically fragile in half precision (full fp16
+    cast produces garbage, full bf16 visible artifacts — measured), so fp16 /
+    bf16 here mean *autocast* mixed precision: weights stay fp32, convs run on
+    tensor cores, norms/reductions stay fp32. Returns (net, autocast_dtype).
+    """
+    try:
+        from spandrel import ModelLoader
+    except ImportError:
+        sys.exit('--arch nafnet needs spandrel: pip install spandrel')
+    desc = ModelLoader().load_from_file(checkpoint)
+    net, _ = _finalize(desc.model, device, 'fp32', channels_last, compile_model)
+    ac_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16,
+                'fp32': None}[precision]
+    mult = getattr(desc.size_requirements, 'multiple_of', 1) or 1
+    return net, ac_dtype, max(mult, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +259,7 @@ def bucket_by_size(paths, batch):
 
 
 class ChunkDataset(torch.utils.data.Dataset):
-    """Each item is one same-size batch, already stacked and normalized."""
+    """Each item is one same-size batch, stacked, in [0,1]."""
 
     def __init__(self, chunks, gray):
         self.chunks = chunks
@@ -199,8 +277,7 @@ class ChunkDataset(torch.utils.data.Dataset):
             if a.ndim == 2:
                 a = a[:, :, None]
             arrs.append(a)
-        x = torch.from_numpy(np.stack(arrs)).permute(0, 3, 1, 2)
-        x = x.div_(127.5).sub_(1.0)  # [0,255] -> [-1,1]
+        x = torch.from_numpy(np.stack(arrs)).permute(0, 3, 1, 2).div_(255.0)
         return x, list(paths)
 
 
@@ -209,7 +286,7 @@ def collate_one(items):
 
 
 # ---------------------------------------------------------------------------
-# Inference
+# Inference helpers
 # ---------------------------------------------------------------------------
 
 def pad_to_multiple(x, m=4):
@@ -220,13 +297,13 @@ def pad_to_multiple(x, m=4):
     return x, h, w
 
 
-def to_uint8_images(y, gray_out):
-    """[-1,1] float batch -> list of HxWx{3|1} uint8 arrays (on CPU)."""
-    if gray_out:
+def to_uint8_images(y, luma_out, lo, hi):
+    """[lo,hi] float batch -> list of HxWx{3|1} uint8 arrays (on CPU)."""
+    if luma_out and y.shape[1] == 3:
         lw = torch.tensor(LUMA, device=y.device, dtype=y.dtype).view(1, 3, 1, 1)
         y = (y * lw).sum(dim=1, keepdim=True)
-    y = (y.float() + 1.0).mul_(127.5).round_().clamp_(0, 255).to(torch.uint8)
-    return list(y.permute(0, 2, 3, 1).cpu().numpy())
+    y = (y.float() - lo).mul_(255.0 / (hi - lo)).round_().clamp_(0, 255)
+    return list(y.to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy())
 
 
 def save_image(arr, path, quality):
@@ -245,26 +322,27 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--input', required=True, help='image file or directory')
     ap.add_argument('--output', required=True, help='output directory')
-    ap.add_argument('--checkpoint',
-                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         'checkpoints', 'experiment_name',
-                                         'latest_net_G.pth'))
+    ap.add_argument('--arch', choices=['deblurgan', 'nafnet', 'student'],
+                    default='deblurgan')
+    ap.add_argument('--checkpoint', default=None,
+                    help='weights path (default depends on --arch)')
     ap.add_argument('--precision', choices=['fp16', 'bf16', 'fp32'], default=None,
                     help='default: fp16 on CUDA, fp32 on CPU')
     ap.add_argument('--gray', action='store_true',
-                    help='grayscale in/out (folds the first conv; output is luma)')
+                    help='grayscale in/out (deblurgan: folds the first conv; '
+                         'nafnet: replicated input, luma output)')
     ap.add_argument('--no-residual', action='store_true',
-                    help='for checkpoints trained without --learn_residual')
+                    help='deblurgan checkpoints trained without --learn_residual')
     ap.add_argument('--batch', type=int, default=1,
                     help='batch size (same-size images are bucketed together)')
     ap.add_argument('--workers', type=int, default=4, help='data-loading workers')
     ap.add_argument('--compile', action='store_true',
-                    help='torch.compile the generator (needs Triton; compiles '
-                         'once per distinct image size, so best for many '
-                         'same-size images)')
+                    help='torch.compile the model (needs Triton; compiles once '
+                         'per distinct image size, so best for many same-size '
+                         'images)')
     ap.add_argument('--channels-last', action='store_true',
-                    help='NHWC memory format (measured slower on this net; '
-                         'mainly useful to cut VRAM at very high resolutions)')
+                    help='NHWC memory format (measured slower on the DeblurGAN '
+                         'net; mainly useful to cut VRAM at very high resolutions)')
     ap.add_argument('--ext', default=None,
                     help="output extension, e.g. png or jpg (default: keep source's)")
     ap.add_argument('--jpeg-quality', type=int, default=95)
@@ -277,11 +355,32 @@ def main():
     if device.type == 'cpu' and args.precision == 'fp16':
         print('[warn] fp16 on CPU is slow; consider --precision fp32')
     torch.backends.cudnn.benchmark = True
+    checkpoint = args.checkpoint or DEFAULT_CKPT[args.arch]
 
-    net, dtype = load_generator(
-        args.checkpoint, device, precision=args.precision, gray=args.gray,
-        residual=not args.no_residual,
-        channels_last=args.channels_last, compile_model=args.compile)
+    # per-arch pipeline config
+    expand3 = False           # replicate 1-ch gray to 3-ch before the net
+    luma_out = args.gray      # collapse 3-ch output to luma
+    ac_dtype = None           # autocast dtype (nafnet); others fully cast
+    if args.arch == 'deblurgan':
+        net, dtype = load_generator(
+            checkpoint, device, precision=args.precision, gray=args.gray,
+            residual=not args.no_residual,
+            channels_last=args.channels_last, compile_model=args.compile)
+        lo, hi, mult = -1.0, 1.0, 4
+    elif args.arch == 'nafnet':
+        net, ac_dtype, mult = load_nafnet(
+            checkpoint, device, precision=args.precision,
+            channels_last=args.channels_last, compile_model=args.compile)
+        dtype = torch.float32   # model and inputs stay fp32; autocast inside
+        lo, hi = 0.0, 1.0
+        expand3 = args.gray
+    else:  # student
+        net, dtype, cfg = load_student(
+            checkpoint, device, precision=args.precision,
+            channels_last=args.channels_last, compile_model=args.compile)
+        lo, hi, mult = -1.0, 1.0, 4
+        args.gray = cfg.get('in_ch', 3) == 1   # dataset side follows the arch
+        luma_out = args.gray and cfg.get('out_ch', 3) == 3
 
     paths = list_images(args.input)
     chunks = bucket_by_size(paths, args.batch)
@@ -294,17 +393,26 @@ def main():
         pin_memory=(device.type == 'cuda'),
         persistent_workers=False)
 
+    ac = (torch.autocast(device.type, dtype=ac_dtype) if ac_dtype is not None
+          else nullcontext())
+
     n_done = 0
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=4) as pool, torch.inference_mode():
         futures = []
         for x, batch_paths in loader:
             x = x.to(device, dtype=dtype, non_blocking=True)
+            if lo == -1.0:
+                x = x * 2 - 1
+            if expand3 and x.shape[1] == 1:
+                x = x.expand(-1, 3, -1, -1)
             if args.channels_last:
                 x = x.to(memory_format=torch.channels_last)
-            x, h, w = pad_to_multiple(x, 4)
-            y = net(x)[:, :, :h, :w]
-            for arr, src in zip(to_uint8_images(y, args.gray), batch_paths):
+            x, h, w = pad_to_multiple(x, mult)
+            with ac:
+                y = net(x)
+            y = y[:, :, :h, :w]
+            for arr, src in zip(to_uint8_images(y, luma_out, lo, hi), batch_paths):
                 stem, src_ext = os.path.splitext(os.path.basename(src))
                 ext = ('.' + args.ext.lstrip('.')) if args.ext else src_ext
                 dst = os.path.join(args.output, stem + args.suffix + ext)
@@ -314,8 +422,10 @@ def main():
         for f in futures:
             f.result()
     dt = time.perf_counter() - t0
+    prec = (f'autocast-{args.precision}' if ac_dtype is not None
+            else args.precision)
     print(f'\ndone: {n_done} images in {dt:.2f}s ({n_done / dt:.2f} img/s) '
-          f'[{device.type}, {args.precision}'
+          f'[{args.arch}, {device.type}, {prec}'
           f'{", gray" if args.gray else ""}{", compiled" if args.compile else ""}]')
 
 

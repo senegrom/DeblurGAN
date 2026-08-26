@@ -205,85 +205,29 @@ class ResnetBlock(nn.Module):
 	def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
 		super(ResnetBlock, self).__init__()
 
-		padAndConv = {
-			'reflect': [
-                nn.ReflectionPad2d(1),
-                nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)],
-			'replicate': [
-                nn.ReplicationPad2d(1),
-                nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)],
-			'zero': [
-                nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=use_bias)]
-		}
-
-		try:
-			blocks = padAndConv[padding_type] + [
-				norm_layer(dim),
-				nn.ReLU(True)
-            ] + [
-				nn.Dropout(0.5)
-			] if use_dropout else [] + padAndConv[padding_type] + [
-				norm_layer(dim)
-			]
-		except:
+		def pad_and_conv():
+			# fresh instances each call: the two convs must not share weights
+			if padding_type == 'reflect':
+				return [nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)]
+			elif padding_type == 'replicate':
+				return [nn.ReplicationPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)]
+			elif padding_type == 'zero':
+				return [nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=use_bias)]
 			raise NotImplementedError('padding [%s] is not implemented' % padding_type)
 
+		# Two convs per block as in the paper. (A former operator-precedence
+		# bug made this a single conv; checkpoints trained before the fix are
+		# the one-conv variant — deblur_fast.py auto-detects both.) The
+		# Dropout slot is always present (p=0 when disabled) so state-dict
+		# keys do not depend on the dropout setting.
+		blocks = (
+			pad_and_conv()
+			+ [norm_layer(dim), nn.ReLU(True), nn.Dropout(0.5 if use_dropout else 0.0)]
+			+ pad_and_conv()
+			+ [norm_layer(dim)]
+		)
+
 		self.conv_block = nn.Sequential(*blocks)
-
-		# self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
-		# def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-		#     padAndConv = {
-		#         'reflect': [nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)],
-		#         'replicate': [nn.ReplicationPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)],
-		#         'zero': [nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=use_bias)]
-		#     }
-		#     try:
-		#         blocks = [
-		#             padAndConv[padding_type],
-		#
-		#             norm_layer(dim),
-		#             nn.ReLU(True),
-		#             nn.Dropout(0.5) if use_dropout else None,
-		#
-		#             padAndConv[padding_type],
-		#
-		#             norm_layer(dim)
-		#         ]
-		#     except:
-		#         raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-		#
-		#     return nn.Sequential(*blocks)
-
-		# blocks = []
-		# if padding_type == 'reflect':
-		# 	blocks += [nn.ReflectionPad2d(1),  nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)]
-		# elif padding_type == 'replicate':
-		# 	blocks += [nn.ReplicationPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)]
-		# elif padding_type == 'zero':
-		# 	blocks += [nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=use_bias)]
-		# else:
-		# 	raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-		#
-		# blocks += [
-		# 	norm_layer(dim),
-		# 	nn.ReLU(True),
-		# 	nn.Dropout(0.5) if use_dropout else None
-		# ]
-		#
-		# if padding_type == 'reflect':
-		# 	blocks += [nn.ReflectionPad2d(1),  nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)]
-		# elif padding_type == 'replicate':
-		# 	blocks += [nn.ReplicationPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias)]
-		# elif padding_type == 'zero':
-		# 	blocks += [nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=use_bias)]
-		# else:
-		# 	raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-		#
-		# blocks += [
-		# 	norm_layer(dim)
-		# ]
-		#
-		# return nn.Sequential(*blocks)
 
 	def forward(self, x):
 		out = x + self.conv_block(x)

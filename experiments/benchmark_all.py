@@ -81,7 +81,9 @@ def main():
                                                           'student_nafnet_tlc',
                                                           'student_best.pth')),
             ('DeblurGAN retrained (modern recipe)',
-             os.path.join(REPO, 'checkpoints', 'retrain', 'deblurgan_best.pth'))):
+             os.path.join(REPO, 'checkpoints', 'retrain', 'deblurgan_best.pth')),
+            ('DeblurGAN retrained v2 (dropout 0.5)',
+             os.path.join(REPO, 'checkpoints', 'retrain_v2', 'deblurgan_best.pth'))):
         if os.path.exists(p):
             student_cks.append((label, p))
 

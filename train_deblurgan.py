@@ -152,7 +152,11 @@ def main():
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--resume', action='store_true')
+    ap.add_argument('--dropout', type=float, default=0.0,
+                    help='generator block dropout (paper used 0.5)')
     args = ap.parse_args()
+    random.seed(0)
+    torch.manual_seed(0)
 
     device = torch.device('cuda')
     torch.backends.cudnn.benchmark = True
@@ -166,13 +170,18 @@ def main():
             f.write(line + '\n')
 
     names = sorted(os.listdir(os.path.join(args.data, 'input')))
-    val_names = names[-args.val_count:]
-    train_names = names[:-args.val_count]
-    log(f'{len(train_names)} train / {len(val_names)} val pairs; '
+    scenes = sorted({n.split('-')[0] for n in names})
+    val_scene = scenes[-1]
+    val_names = [n for n in names if n.startswith(val_scene)]
+    val_names = val_names[::max(1, len(val_names) // args.val_count)][:args.val_count]
+    train_names = [n for n in names if not n.startswith(val_scene)]
+    log(f'{len(train_names)} train / {len(val_names)} val pairs '
+        f'(val scene {val_scene}, scene-disjoint); '
         f'gan={args.gan_type} content_w={args.content_weight} '
-        f'pixel_w={args.pixel_weight}')
+        f'pixel_w={args.pixel_weight} dropout={args.dropout}')
 
-    netG = FastGenerator(**ARCH_CONFIG).to(device).train()
+    arch_config = dict(ARCH_CONFIG, dropout=args.dropout)
+    netG = FastGenerator(**arch_config).to(device).train()
     netD = NLayerDiscriminator().to(device).train()
     vgg = VGGContent(device)
     log(f'G params: {sum(p.numel() for p in netG.parameters()) / 1e6:.2f}M, '
@@ -201,9 +210,12 @@ def main():
         shuffle=True, num_workers=args.workers, pin_memory=True,
         drop_last=True, persistent_workers=True)
 
+    meta = {'args': {k: v for k, v in vars(args).items()},
+            'val_scene': val_scene, 'seed': 0}
+
     def save(tag, it, psnr):
-        torch.save({'arch_config': ARCH_CONFIG, 'state_dict': netG.state_dict(),
-                    'iter': it, 'psnr': psnr},
+        torch.save({'arch_config': arch_config, 'state_dict': netG.state_dict(),
+                    'iter': it, 'psnr': psnr, 'meta': meta},
                    os.path.join(args.out, f'deblurgan_{tag}.pth'))
 
     it = start_iter
@@ -279,14 +291,14 @@ def main():
             psnr, base = evaluate(netG, args.data, val_names, device)
             log(f'iter {it}: val PSNR {psnr:.2f} dB (blurry input: {base:.2f})')
             save('latest', it, psnr)
-            torch.save({'G': netG.state_dict(), 'D': netD.state_dict(),
-                        'optG': optG.state_dict(), 'optD': optD.state_dict(),
-                        'schedG': schedG.state_dict(), 'schedD': schedD.state_dict(),
-                        'iter': it, 'best_psnr': best_psnr}, state_path)
             if psnr > best_psnr:
                 best_psnr = psnr
                 save('best', it, psnr)
                 log(f'new best: {psnr:.2f} dB')
+            torch.save({'G': netG.state_dict(), 'D': netD.state_dict(),
+                        'optG': optG.state_dict(), 'optD': optD.state_dict(),
+                        'schedG': schedG.state_dict(), 'schedD': schedD.state_dict(),
+                        'iter': it, 'best_psnr': best_psnr}, state_path)
 
     psnr, _ = evaluate(netG, args.data, val_names, device)
     save('latest', it, psnr)

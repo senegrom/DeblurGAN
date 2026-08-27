@@ -70,13 +70,18 @@ def main():
              f'({torch.cuda.get_device_name(0)}, torch {torch.__version__})', '']
 
     official_ck = os.path.join(REPO, 'checkpoints', 'official', 'latest_net_G.pth')
-    student_cks = []          # every student-container checkpoint that exists
+    student_cks = []          # every FastGenerator-container checkpoint present
     for label, p in (
             ('student GT-trained', os.path.join(REPO, 'checkpoints', 'student',
                                                 'student_best.pth')),
             ('student NAFNet-distilled', os.path.join(REPO, 'checkpoints',
                                                       'student_nafnet',
-                                                      'student_best.pth'))):
+                                                      'student_best.pth')),
+            ('student NAFNet-TLC-distilled', os.path.join(REPO, 'checkpoints',
+                                                          'student_nafnet_tlc',
+                                                          'student_best.pth')),
+            ('DeblurGAN retrained (modern recipe)',
+             os.path.join(REPO, 'checkpoints', 'retrain', 'deblurgan_best.pth'))):
         if os.path.exists(p):
             student_cks.append((label, p))
 
@@ -92,15 +97,17 @@ def main():
 
     official, _ = load_generator(official_ck, dev, precision='fp16')
     naf, naf_ac, naf_mult = load_nafnet(DEFAULT_CKPT['nafnet'], dev, 'fp16')
-    students = []
+    containers = []
     for label, p in student_cks:
         net, dt, cfg = load_student(p, dev, precision='fp16')
         it = torch.load(p, map_location='cpu', weights_only=True).get('iter', '?')
-        students.append((f'{label}@{it} (gray)', net, dt))
+        rgb = cfg.get('in_ch', 3) == 3
+        containers.append((f'{label}@{it} ({"RGB" if rgb else "gray"})',
+                           net, dt, rgb))
 
     sums = {'input (RGB)': 0.0, 'official DeblurGAN (RGB)': 0.0,
             'NAFNet-w64 (RGB)': 0.0, 'input (gray)': 0.0}
-    sums.update({label: 0.0 for label, _, _ in students})
+    sums.update({label: 0.0 for label, _, _, _ in containers})
     with torch.inference_mode():
         for i, key in enumerate(keys):
             x = get(env_in, key, dev)
@@ -118,10 +125,11 @@ def main():
 
             xg, gtg = luma(x), luma(gt)
             sums['input (gray)'] += psnr8(xg, gtg)
-            for label, stu, dt in students:
-                xp, h, w = pad_to_multiple((xg * 2 - 1).to(dt), 4)
+            for label, stu, dt, rgb in containers:
+                src, ref = (x, gt) if rgb else (xg, gtg)
+                xp, h, w = pad_to_multiple((src * 2 - 1).to(dt), 4)
                 y = stu(xp)[:, :, :h, :w]
-                sums[label] += psnr8((y.float() + 1) / 2, gtg)
+                sums[label] += psnr8((y.float() + 1) / 2, ref)
 
             if (i + 1) % 200 == 0:
                 print(f'{i + 1}/{len(keys)}', flush=True)
@@ -134,7 +142,7 @@ def main():
     lines.append('')
     print('\n'.join(lines[-(len(sums) + 4):]), flush=True)
 
-    del official, naf, students
+    del official, naf, containers
     torch.cuda.empty_cache()
 
     # ---------------- speed --------------------------------------------------

@@ -96,14 +96,17 @@ class ResBlock(nn.Module):
                      other DeblurGAN forks). Conv keys: conv_block.1 / .5
     """
 
-    def __init__(self, dim, block_layout='legacy'):
+    def __init__(self, dim, block_layout='legacy', dropout=0.0):
         super().__init__()
         first = [nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, 3, bias=True),
                  _norm(dim), nn.ReLU(True)]
         if block_layout == 'legacy':
             layers = first
         elif block_layout == 'paper':
-            layers = first + [nn.Identity(),   # inference stand-in for Dropout
+            # slot 4 is the paper's dropout position; parameterless either way,
+            # so checkpoint keys are identical with or without dropout
+            mid = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+            layers = first + [mid,
                               nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, 3, bias=True),
                               _norm(dim)]
         elif block_layout == 'paper_nodrop':
@@ -119,7 +122,7 @@ class ResBlock(nn.Module):
 
 class FastGenerator(nn.Module):
     def __init__(self, in_ch=3, out_ch=3, ngf=64, n_blocks=9, residual=True,
-                 trunk=None, block_layout='legacy'):
+                 trunk=None, block_layout='legacy', dropout=0.0):
         super().__init__()
         self.residual = residual
         trunk = trunk or ngf * 4   # width of the residual-block stream
@@ -136,7 +139,7 @@ class FastGenerator(nn.Module):
             _norm(trunk),
             nn.ReLU(True),
         ]
-        layers += [ResBlock(trunk, block_layout) for _ in range(n_blocks)]
+        layers += [ResBlock(trunk, block_layout, dropout) for _ in range(n_blocks)]
         layers += [
             nn.ConvTranspose2d(trunk, ngf * 2, kernel_size=3, stride=2,
                                padding=1, output_padding=1, bias=True),
@@ -216,21 +219,73 @@ def load_student(checkpoint, device, precision='fp16', channels_last=False,
     return net, dtype, cfg
 
 
+class _TLCAvgPool2d(nn.Module):
+    """Test-time Local Converter pooling (NAFNetLocal, from megvii's
+    local_arch.py). Replaces the global AdaptiveAvgPool2d(1) inside NAFNet's
+    channel attention: at test resolutions above the 256x256 training crops,
+    global pooling mismatches training statistics; a local window whose extent
+    matches base_size (1.5x the train crop) in input pixels restores them.
+    The kernel size per layer is fixed by a dry forward at train size.
+    """
+
+    def __init__(self, base_size=384, train_size=256):
+        super().__init__()
+        self.base_size = base_size
+        self.train_size = train_size
+        self.kernel_size = None
+
+    def forward(self, x):
+        if self.kernel_size is None:
+            # dry forward at train resolution: feature size * base / train
+            self.kernel_size = (x.shape[-2] * self.base_size // self.train_size,
+                                x.shape[-1] * self.base_size // self.train_size)
+        k1, k2 = self.kernel_size
+        h, w = x.shape[-2:]
+        if k1 >= h and k2 >= w:
+            return F.adaptive_avg_pool2d(x, 1)
+        k1, k2 = min(k1, h), min(k2, w)
+        s = x.cumsum(-1).cumsum(-2)
+        s = F.pad(s, (1, 0, 1, 0))                    # zero row/col for windows
+        out = (s[..., k1:, k2:] - s[..., :-k1, k2:]
+               - s[..., k1:, :-k2] + s[..., :-k1, :-k2]) / (k1 * k2)
+        pt, pl = k1 - 1 - (k1 - 1) // 2, k2 - 1 - (k2 - 1) // 2
+        return F.pad(out, (pl, k2 - 1 - pl, pt, k1 - 1 - pt), mode='replicate')
+
+
+def _apply_tlc(net, device, base_size=384, train_size=256):
+    """Swap NAFNet's global pools for TLC pools and fix their kernels."""
+    swapped = 0
+    for module in net.modules():
+        for name, child in module.named_children():
+            if isinstance(child, nn.AdaptiveAvgPool2d) and child.output_size in (1, (1, 1)):
+                setattr(module, name, _TLCAvgPool2d(base_size, train_size))
+                swapped += 1
+    if swapped:
+        with torch.inference_mode():
+            net(torch.zeros(1, 3, train_size, train_size, device=device))
+    return swapped
+
+
 def load_nafnet(checkpoint, device, precision='fp16', channels_last=False,
-                compile_model=False):
+                compile_model=False, tlc=True):
     """Load a NAFNet checkpoint via spandrel. Input/output range is [0,1].
 
     NAFNet's LayerNorms are numerically fragile in half precision (full fp16
     cast produces garbage, full bf16 visible artifacts — measured), so fp16 /
     bf16 here mean *autocast* mixed precision: weights stay fp32, convs run on
     tensor cores, norms/reductions stay fp32. Returns (net, autocast_dtype).
+    tlc=True applies the official test-time local-pooling conversion
+    (NAFNetLocal), which the official GoPro evaluation uses.
     """
     try:
         from spandrel import ModelLoader
     except ImportError:
         sys.exit('--arch nafnet needs spandrel: pip install spandrel')
     desc = ModelLoader().load_from_file(checkpoint)
-    net, _ = _finalize(desc.model, device, 'fp32', channels_last, compile_model)
+    net = desc.model.eval().requires_grad_(False).to(device)
+    if tlc:
+        _apply_tlc(net, device)
+    net, _ = _finalize(net, device, 'fp32', channels_last, compile_model)
     ac_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16,
                 'fp32': None}[precision]
     mult = getattr(desc.size_requirements, 'multiple_of', 1) or 1
@@ -345,6 +400,8 @@ def main():
                          'nafnet: replicated input, luma output)')
     ap.add_argument('--no-residual', action='store_true',
                     help='deblurgan checkpoints trained without --learn_residual')
+    ap.add_argument('--no-tlc', action='store_true',
+                    help='nafnet: disable test-time local pooling (NAFNetLocal)')
     ap.add_argument('--batch', type=int, default=1,
                     help='batch size (same-size images are bucketed together)')
     ap.add_argument('--workers', type=int, default=4, help='data-loading workers')
@@ -382,7 +439,8 @@ def main():
     elif args.arch == 'nafnet':
         net, ac_dtype, mult = load_nafnet(
             checkpoint, device, precision=args.precision,
-            channels_last=args.channels_last, compile_model=args.compile)
+            channels_last=args.channels_last, compile_model=args.compile,
+            tlc=not args.no_tlc)
         dtype = torch.float32   # model and inputs stay fp32; autocast inside
         lo, hi = 0.0, 1.0
         expand3 = args.gray

@@ -8,3 +8,4 @@
 !examples/**/*.png
 !checkpoints/official/*.pth
 !checkpoints/student_nafnet/student_best.pth
+!checkpoints/student/student_best.pth

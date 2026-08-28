@@ -16,8 +16,10 @@ Architectures (--arch):
              paper-correct two-conv checkpoints, with or without dropout.
   nafnet     NAFNet (e.g. NAFNet-GoPro-width64.pth) loaded via `spandrel`
              (pip install spandrel). ~+5 dB over DeblurGAN on GoPro.
-  student    slim distilled FastGenerator checkpoints produced by
-             train_student.py (self-describing .pth with arch_config).
+  student    slim FastGenerator checkpoints produced by train_student.py
+             (self-describing .pth with arch_config). Default weights are the
+             NAFNet-distilled student; --arch student-gt selects the
+             GT-supervised variant.
 
 Unlike test.py, this processes images at native resolution (padded to the
 network's required multiple) instead of random 256x256 crops, and it runs
@@ -68,6 +70,10 @@ DEFAULT_CKPT = {
     'nafnet': os.path.join(_REPO, 'checkpoints', 'NAFNet-GoPro-width64.pth'),
     'student': _first_existing(
         os.path.join(_REPO, 'checkpoints', 'student_nafnet', 'student_best.pth'),
+        os.path.join(_REPO, 'checkpoints', 'student', 'student_best.pth'),
+        os.path.join(_REPO, 'checkpoints', 'student', 'student_latest.pth')),
+    # the GT-supervised (non-distilled) student, 29.07 dB vs the distilled 29.29
+    'student-gt': _first_existing(
         os.path.join(_REPO, 'checkpoints', 'student', 'student_best.pth'),
         os.path.join(_REPO, 'checkpoints', 'student', 'student_latest.pth')),
 }
@@ -389,8 +395,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--input', required=True, help='image file or directory')
     ap.add_argument('--output', required=True, help='output directory')
-    ap.add_argument('--arch', choices=['deblurgan', 'nafnet', 'student'],
-                    default='deblurgan')
+    ap.add_argument('--arch',
+                    choices=['deblurgan', 'nafnet', 'student', 'student-gt'],
+                    default='deblurgan',
+                    help='student = NAFNet-distilled slim model (default '
+                         'weights); student-gt = the GT-supervised variant')
     ap.add_argument('--checkpoint', default=None,
                     help='weights path (default depends on --arch)')
     ap.add_argument('--precision', choices=['fp16', 'bf16', 'fp32'], default=None,

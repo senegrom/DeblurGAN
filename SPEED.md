@@ -33,7 +33,8 @@ in `D:\PyEnv\torch`; `py` below means `D:\PyEnv\torch\Scripts\python.exe`.
 ```powershell
 py deblur_fast.py --input <img-or-dir> --output <dir>                  # official DeblurGAN
 py deblur_fast.py --arch nafnet  --input <dir> --output <dir>          # best quality
-py deblur_fast.py --arch student --input <dir> --output <dir>          # real-time, grayscale
+py deblur_fast.py --arch student --input <dir> --output <dir>          # real-time, grayscale (NAFNet-distilled)
+py deblur_fast.py --arch student-gt --input <dir> --output <dir>       # same model, GT-supervised weights
 py deblur_fast.py --input examples\gopro\input --output examples\gopro\deblurred   # demo
 py deblur_fast.py --input D:\frames --output D:\out --batch 4 --compile --ext jpg  # bulk
 ```

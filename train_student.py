@@ -164,6 +164,10 @@ def main():
         log(f'warm-started from {args.init} '
             f'(iter {init_sd.get("iter", "?")}); init val PSNR on this split: '
             f'{start_best:.2f} dB (installed as best)')
+        os.makedirs(args.out, exist_ok=True)
+        torch.save({'arch_config': ARCH_CONFIG, 'state_dict': net.state_dict(),
+                    'iter': 0, 'psnr': start_best},
+                   os.path.join(args.out, 'student_best.pth'))
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.9),
                             weight_decay=1e-4)

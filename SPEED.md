@@ -7,15 +7,20 @@ RTX 5070 Ti (16 GB), PyTorch 2.13.0+cu130, Python 3.14, venv `D:\PyEnv\torch`.
 | model | avg PSNR | 720p ms (compiled) | 1080p ms (compiled) |
 |---|---|---|---|
 | blurry input (RGB / gray) | 25.64 / 25.69 | — | — |
+| DeblurGAN retrained here (modern recipe, RGB) | 27.21 | same as official | same |
 | official DeblurGAN, recovered (11.4M, RGB) | 27.30 | 33.4 (19.6) | 81.2 (45.9) |
 | student, GT-trained (2.84M, gray) | 29.07 | 13.0 (**6.6**) | 32.6 (**14.5**) |
 | **student, NAFNet-distilled (2.84M, gray)** | **29.29** | same | same |
-| NAFNet-w64 (68M, RGB) | 33.08 | 123.8 (42.5) | 327.4 (102.2) |
+| NAFNet-w64 with TLC (68M, RGB) | 33.71 | 156 (—) | 428 (—) |
 
-The distilled student (committed at `checkpoints/student_nafnet/student_best.pth`)
-is the `--arch student` default. Reproduce: `python experiments/benchmark_all.py`.
-Paper reports 28.7 dB for DeblurGAN (Y-channel vs RGB PSNR accounts for the
-offset).
+NAFNet's 33.71 matches its paper number exactly once test-time local pooling
+(TLC/NAFNetLocal, default here) is applied; without it 33.08 and ~25% faster.
+A redistillation with TLC teacher labels and a scene-disjoint val split
+reproduced the distilled student within noise (29.30), confirming the +0.22
+distillation gain over GT training. The distilled student
+(`checkpoints/student_nafnet/student_best.pth`) is the `--arch student`
+default. Reproduce: `python experiments/benchmark_all.py`. Paper reports
+28.7 dB for DeblurGAN (Y-channel vs RGB PSNR accounts for the offset).
 
 ## Tutorial
 

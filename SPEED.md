@@ -7,11 +7,17 @@ RTX 5070 Ti (16 GB), PyTorch 2.13.0+cu130, Python 3.14, venv `D:\PyEnv\torch`.
 | model | avg PSNR | 720p ms (compiled) | 1080p ms (compiled) |
 |---|---|---|---|
 | blurry input (RGB / gray) | 25.64 / 25.69 | — | — |
+| DeblurGAN retrained v2 (+dropout 0.5, RGB) | 26.58 | same as official | same |
 | DeblurGAN retrained here (modern recipe, RGB) | 27.21 | same as official | same |
 | official DeblurGAN, recovered (11.4M, RGB) | 27.30 | 33.4 (19.6) | 81.2 (45.9) |
 | student, GT-trained (2.84M, gray) | 29.07 | 13.0 (**6.6**) | 32.6 (**14.5**) |
 | **student, NAFNet-distilled (2.84M, gray)** | **29.29** | same | same |
 | NAFNet-w64 with TLC (68M, RGB) | 33.71 | 156 (—) | 428 (—) |
+
+Retrain findings: the modernized recipe (no dropout) ties the official
+weights (27.21 vs 27.30); adding the paper's dropout 0.5 to it *hurts*
+(26.58) — over-regularization at batch 8 / 60k iters. The official weights
+stay the `--arch deblurgan` default.
 
 NAFNet's 33.71 matches its paper number exactly once test-time local pooling
 (TLC/NAFNetLocal, default here) is applied; without it 33.08 and ~25% faster.

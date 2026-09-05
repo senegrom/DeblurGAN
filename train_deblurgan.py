@@ -1,10 +1,12 @@
 """Retrain the real (two-conv) DeblurGAN generator on GoPro pairs.
 
-The official pretrained weights are gone from every source (see SPEED.md), and
-every surviving checkpoint was trained on the one-conv ResnetBlock bug. This
-script retrains the paper architecture — FastGenerator block_layout='paper',
-identical state-dict layout to the original released weights (issue #145) —
-with the paper's losses, modernized:
+Trains the paper architecture — FastGenerator block_layout='paper', the same
+state-dict layout as the recovered official weights (checkpoints/official/) —
+with the paper's losses, modernized. Measured (SPEED.md): this recipe without
+dropout ties the official weights on the GoPro test (27.21 vs 27.30 dB);
+adding the paper's dropout 0.5 hurts at this batch size / schedule (26.58).
+
+Losses:
 
   * content: VGG19 conv3_3 feature MSE x100 (with proper ImageNet norm)
   * adversarial: WGAN-GP (5 critic iters, lambda 10) or --gan-type lsgan
@@ -17,7 +19,6 @@ Checkpoints are self-describing and load with:
 """
 
 import argparse
-import math
 import os
 import random
 import time
@@ -29,6 +30,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from deblur_fast import FastGenerator, pad_to_multiple
+from deblur_utils import charbonnier, psnr8_signed, scene_disjoint_split
 
 ARCH_CONFIG = dict(in_ch=3, out_ch=3, ngf=64, n_blocks=9, residual=True,
                    trunk=256, block_layout='paper')
@@ -96,23 +98,12 @@ class VGGContent(nn.Module):
         return self.feats(x)
 
 
-def charbonnier(a, b, eps=1e-3):
-    return torch.sqrt((a - b) ** 2 + eps * eps).mean()
-
-
 def gradient_penalty(critic, real, fake):
     alpha = torch.rand(real.size(0), 1, 1, 1, device=real.device)
     mix = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
     score = critic(mix)
     grad = torch.autograd.grad(score.sum(), mix, create_graph=True)[0]
     return ((grad.flatten(1).norm(2, dim=1) - 1) ** 2).mean()
-
-
-def psnr_pair(pred, gt):
-    p = (pred.float() + 1).mul(127.5).round_().clamp_(0, 255)
-    g = (gt.float() + 1).mul(127.5).round_().clamp_(0, 255)
-    mse = (p - g).pow(2).mean().item()
-    return float('inf') if mse == 0 else 20 * math.log10(255 / math.sqrt(mse))
 
 
 @torch.inference_mode()
@@ -128,8 +119,8 @@ def evaluate(net, root, names, device):
         g = torch.from_numpy(sharp.transpose(2, 0, 1))[None].to(device)
         xp, h, w = pad_to_multiple(x, 4)
         y = net(xp)[:, :, :h, :w]
-        tot += psnr_pair(y, g)
-        base += psnr_pair(x, g)
+        tot += psnr8_signed(y, g)
+        base += psnr8_signed(x, g)
     net.train()
     return tot / len(names), base / len(names)
 
@@ -170,11 +161,7 @@ def main():
             f.write(line + '\n')
 
     names = sorted(os.listdir(os.path.join(args.data, 'input')))
-    scenes = sorted({n.split('-')[0] for n in names})
-    val_scene = scenes[-1]
-    val_names = [n for n in names if n.startswith(val_scene)]
-    val_names = val_names[::max(1, len(val_names) // args.val_count)][:args.val_count]
-    train_names = [n for n in names if not n.startswith(val_scene)]
+    train_names, val_names, val_scene = scene_disjoint_split(names, args.val_count)
     log(f'{len(train_names)} train / {len(val_names)} val pairs '
         f'(val scene {val_scene}, scene-disjoint); '
         f'gan={args.gan_type} content_w={args.content_weight} '
@@ -246,8 +233,9 @@ def main():
                 lossD = (netD(fake).mean() - netD(sharp).mean()
                          + 10.0 * gradient_penalty(netD, sharp, fake))
             else:
-                lossD = 0.5 * (F.mse_loss(netD(sharp), torch.ones_like(netD(sharp)))
-                               + F.mse_loss(netD(fake), torch.zeros_like(netD(fake))))
+                d_real, d_fake = netD(sharp), netD(fake)
+                lossD = 0.5 * (F.mse_loss(d_real, torch.ones_like(d_real))
+                               + F.mse_loss(d_fake, torch.zeros_like(d_fake)))
             lossD.backward()
             optD.step()
         schedD.step()

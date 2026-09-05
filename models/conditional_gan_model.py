@@ -78,9 +78,10 @@ class ConditionalGAN(BaseModel):
 
 	# no backprop gradients
 	def test(self):
-		self.real_A = Variable(self.input_A, volatile=True)
-		self.fake_B = self.netG.forward(self.real_A)
-		self.real_B = Variable(self.input_B, volatile=True)
+		with torch.no_grad():
+			self.real_A = self.input_A
+			self.fake_B = self.netG.forward(self.real_A)
+			self.real_B = self.input_B
 
 	# get image paths
 	def get_image_paths(self):

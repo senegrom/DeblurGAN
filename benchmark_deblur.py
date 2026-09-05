@@ -10,12 +10,11 @@ compile variants at several resolutions, using the real trained checkpoint.
 
 import argparse
 import math
-import os
 
 import torch
 import torch.nn.functional as F
 
-from deblur_fast import FastGenerator, load_generator, pad_to_multiple, LUMA
+from deblur_fast import DEFAULT_CKPT, load_generator, pad_to_multiple, LUMA
 
 SIZES = [(256, 256), (1280, 720), (1920, 1080)]
 
@@ -63,10 +62,9 @@ def bench_one(net, x, iters, warmup=5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--checkpoint',
-                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         'checkpoints', 'experiment_name',
-                                         'latest_net_G.pth'))
+    ap.add_argument('--checkpoint', default=DEFAULT_CKPT['deblurgan'],
+                    help='any DeblurGAN generator checkpoint (block layout '
+                         'auto-detected)')
     ap.add_argument('--iters', type=int, default=20)
     ap.add_argument('--compile', action='store_true')
     args = ap.parse_args()

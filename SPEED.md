@@ -12,7 +12,7 @@ RTX 5070 Ti (16 GB), PyTorch 2.13.0+cu130, Python 3.14, venv `D:\PyEnv\torch`.
 | official DeblurGAN, recovered (11.4M, RGB) | 27.30 | 33.4 (19.6) | 81.2 (45.9) |
 | student, GT-trained (2.84M, gray) | 29.07 | 13.0 (**6.6**) | 32.6 (**14.5**) |
 | **student, NAFNet-distilled (2.84M, gray)** | **29.29** | same | same |
-| NAFNet-w64 with TLC (68M, RGB) | 33.71 | 156 (—) | 428 (—) |
+| NAFNet-w64 with TLC (68M, RGB) | 33.71 | 156 (60) | 428 (239) |
 
 Retrain findings: the modernized recipe (no dropout) ties the official
 weights (27.21 vs 27.30); adding the paper's dropout 0.5 to it *hurts*
@@ -20,7 +20,8 @@ weights (27.21 vs 27.30); adding the paper's dropout 0.5 to it *hurts*
 stay the `--arch deblurgan` default.
 
 NAFNet's 33.71 matches its paper number exactly once test-time local pooling
-(TLC/NAFNetLocal, default here) is applied; without it 33.08 and ~25% faster.
+(TLC/NAFNetLocal, default here) is applied; without it 33.08 and faster
+(compiled 102 ms/1080p vs 239 — TLC's local pooling fuses poorly at 1080p).
 A redistillation with TLC teacher labels and a scene-disjoint val split
 reproduced the distilled student within noise (29.30), confirming the +0.22
 distillation gain over GT training. The distilled student
@@ -55,6 +56,8 @@ py deblur_fast.py --input D:\frames --output D:\out --batch 4 --compile --ext jp
 | `--precision fp16\|bf16\|fp32` | default fp16 (nafnet: autocast — full half casts break its LayerNorms) |
 | `--ext`, `--jpeg-quality`, `--suffix`, `--workers` | output format / naming / loader threads |
 | `--no-residual` | for DeblurGAN checkpoints trained without `--learn_residual` |
+| `--no-tlc` | nafnet: plain global pooling instead of NAFNetLocal (−0.6 dB, ~25% faster) |
+| `--deterministic` | bit-reproducible outputs (no cuDNN autotune); default fp16 runs differ by ~1 LSB |
 
 ### Benchmark
 
@@ -73,7 +76,7 @@ Data layout: `<data>/input/*.png` + `<data>/target/*.png` (GoPro train at
 py train_student.py                                # slim gray student, 100k iters (~7 h)
 py train_student.py --resume                       # continue after a crash
 py experiments/make_teacher_labels.py              # precompute NAFNet outputs (once, ~6 min)
-py train_student.py --teacher-sub teacher_nafnet --init checkpoints/student/student_best.pth --iters 60000 --lr 1.5e-4 --out checkpoints/student_nafnet   # distill from NAFNet
+py train_student.py --teacher-sub teacher_nafnet_tlc --init checkpoints/student/student_best.pth --iters 60000 --lr 1.5e-4 --out checkpoints/student_nafnet   # distill from NAFNet
 py train_deblurgan.py --iters 60000                # full paper retrain, modernized (~1 day)
 ```
 
@@ -92,8 +95,9 @@ $p.PriorityClass = 'Idle'
 
 ## Findings
 
-- `deblur_fast.py` replaces `test.py`: full-resolution inference (reflect-pad,
-  not 256² crops), dropout off (`test.py` left it active — stochastic output),
+- `deblur_fast.py` replaces the legacy `test.py` (now removed): full-resolution
+  inference (reflect-pad, not 256² crops), dropout off (`test.py` left it
+  active — stochastic output),
   per-instance norm stats, prefetching, threaded encoding. Verified
   bit-identical to the original network.
 - fp16 is safe (66 dB vs fp32) and default. torch.compile is the big lever:

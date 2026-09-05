@@ -8,6 +8,7 @@ per-crop teachering) and removes all teacher cost from the training loop.
   python experiments/make_teacher_labels.py --data D:/Photos/TrainingData/GoPro/train
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -25,8 +26,11 @@ from deblur_fast import DEFAULT_CKPT, load_nafnet, pad_to_multiple
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default=r'D:/Photos/TrainingData/GoPro/train')
-    ap.add_argument('--out-sub', default='teacher_nafnet')
+    ap.add_argument('--out-sub', default='teacher_nafnet_tlc',
+                    help='output subdir under --data (default reflects the '
+                         'TLC teacher; older teacher_nafnet/ dirs are non-TLC)')
     ap.add_argument('--checkpoint', default=DEFAULT_CKPT['nafnet'])
+    ap.add_argument('--no-tlc', action='store_true')
     args = ap.parse_args()
     dev = 'cuda'
     torch.backends.cudnn.benchmark = True
@@ -34,6 +38,20 @@ def main():
     in_dir = os.path.join(args.data, 'input')
     out_dir = os.path.join(args.data, args.out_sub)
     os.makedirs(out_dir, exist_ok=True)
+    # provenance marker so a label dir can never be mistaken for another
+    # teacher configuration (skip-existing would otherwise mix them silently)
+    marker = os.path.join(out_dir, 'TEACHER.json')
+    config = {'checkpoint': os.path.basename(args.checkpoint),
+              'tlc': not args.no_tlc, 'precision': 'autocast-fp16'}
+    if os.path.exists(marker):
+        with open(marker) as f:
+            prev = json.load(f)
+        if prev != config:
+            sys.exit(f'{out_dir} was generated with a different teacher config '
+                     f'{prev}; use another --out-sub')
+    else:
+        with open(marker, 'w') as f:
+            json.dump(config, f)
     names = sorted(n for n in os.listdir(in_dir)
                    if not os.path.exists(os.path.join(out_dir, n)))
     print(f'{len(names)} images to label -> {out_dir}', flush=True)

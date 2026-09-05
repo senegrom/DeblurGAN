@@ -11,17 +11,16 @@ autocast, cosine LR. Checkpoints are self-describing and load directly with
 """
 
 import argparse
-import math
 import os
 import random
 import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from deblur_fast import FastGenerator, pad_to_multiple
+from deblur_utils import charbonnier, fft_l1, psnr8_signed, scene_disjoint_split
 
 ARCH_CONFIG = dict(in_ch=1, out_ch=1, ngf=32, n_blocks=9, residual=True,
                    trunk=128, block_layout='paper')
@@ -64,25 +63,8 @@ class GrayPairs(torch.utils.data.Dataset):
                      for im in imgs)
 
 
-def charbonnier(a, b, eps=1e-3):
-    return torch.sqrt((a - b) ** 2 + eps * eps).mean()
-
-
-def fft_l1(a, b):
-    fa, fb = torch.fft.rfft2(a), torch.fft.rfft2(b)
-    return (torch.view_as_real(fa) - torch.view_as_real(fb)).abs().mean()
-
-
-def psnr_pair(pred, gt):
-    """uint8-domain PSNR for tensors in [-1,1]."""
-    p = (pred.float() + 1).mul(127.5).round_().clamp_(0, 255)
-    g = (gt.float() + 1).mul(127.5).round_().clamp_(0, 255)
-    mse = (p - g).pow(2).mean().item()
-    return float('inf') if mse == 0 else 20 * math.log10(255 / math.sqrt(mse))
-
-
 @torch.inference_mode()
-def evaluate(net, root, names, device, log):
+def evaluate(net, root, names, device):
     net.eval()
     tot, base = 0.0, 0.0
     for name in names:
@@ -94,8 +76,8 @@ def evaluate(net, root, names, device, log):
         g = torch.from_numpy(sharp)[None, None].to(device)
         xp, h, w = pad_to_multiple(x, 4)
         y = net(xp)[:, :, :h, :w]
-        tot += psnr_pair(y, g)
-        base += psnr_pair(x, g)
+        tot += psnr8_signed(y, g)
+        base += psnr8_signed(x, g)
     net.train()
     return tot / len(names), base / len(names)
 
@@ -140,11 +122,7 @@ def main():
     # scene-disjoint split: the whole last scene is held out (subsampled for
     # eval speed) so no frames of a validation video leak into training
     names = sorted(os.listdir(os.path.join(args.data, 'input')))
-    scenes = sorted({n.split('-')[0] for n in names})
-    val_scene = scenes[-1]
-    val_names = [n for n in names if n.startswith(val_scene)]
-    val_names = val_names[::max(1, len(val_names) // args.val_count)][:args.val_count]
-    train_names = [n for n in names if not n.startswith(val_scene)]
+    train_names, val_names, val_scene = scene_disjoint_split(names, args.val_count)
     log(f'{len(train_names)} train / {len(val_names)} val pairs from {args.data} '
         f'(val scene {val_scene}, scene-disjoint)')
 
@@ -154,20 +132,25 @@ def main():
     if args.teacher_sub:
         log(f'distillation: teacher targets from {args.teacher_sub}/ '
             f'(alpha {args.teacher_alpha}), validation still scored vs GT')
+    meta = {'args': {k: v for k, v in vars(args).items()},
+            'val_scene': val_scene, 'seed': 0}
+
+    def save(tag, it, psnr):
+        torch.save({'arch_config': ARCH_CONFIG, 'state_dict': net.state_dict(),
+                    'iter': it, 'psnr': psnr, 'meta': meta},
+                   os.path.join(args.out, f'student_{tag}.pth'))
+
     start_best = 0.0
     if args.init:
         init_sd = torch.load(args.init, map_location=device, weights_only=True)
         net.load_state_dict(init_sd['state_dict'])
         # the warm-start model's own val score is the bar a checkpoint must
         # beat before it may become this run's "best"
-        start_best, _ = evaluate(net, args.data, val_names, device, log)
+        start_best, _ = evaluate(net, args.data, val_names, device)
         log(f'warm-started from {args.init} '
             f'(iter {init_sd.get("iter", "?")}); init val PSNR on this split: '
             f'{start_best:.2f} dB (installed as best)')
-        os.makedirs(args.out, exist_ok=True)
-        torch.save({'arch_config': ARCH_CONFIG, 'state_dict': net.state_dict(),
-                    'iter': 0, 'psnr': start_best},
-                   os.path.join(args.out, 'student_best.pth'))
+        save('best', 0, start_best)
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.9),
                             weight_decay=1e-4)
@@ -190,14 +173,6 @@ def main():
     loader = torch.utils.data.DataLoader(
         ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
         pin_memory=True, drop_last=True, persistent_workers=True)
-
-    meta = {'args': {k: v for k, v in vars(args).items()},
-            'val_scene': val_scene, 'seed': 0}
-
-    def save(tag, it, psnr):
-        torch.save({'arch_config': ARCH_CONFIG, 'state_dict': net.state_dict(),
-                    'iter': it, 'psnr': psnr, 'meta': meta},
-                   os.path.join(args.out, f'student_{tag}.pth'))
 
     it = start_iter
     t0 = time.time()
@@ -239,7 +214,7 @@ def main():
                 loss_acc, n_acc = 0.0, 0
 
             if it % args.eval_every == 0:
-                psnr, base = evaluate(net, args.data, val_names, device, log)
+                psnr, base = evaluate(net, args.data, val_names, device)
                 log(f'iter {it}: val PSNR {psnr:.2f} dB (blurry input: {base:.2f})')
                 save('latest', it, psnr)
                 if psnr > best_psnr:
@@ -250,7 +225,7 @@ def main():
                             'sched': sched.state_dict(), 'iter': it,
                             'best_psnr': best_psnr}, state_path)
 
-    psnr, base = evaluate(net, args.data, val_names, device, log)
+    psnr, base = evaluate(net, args.data, val_names, device)
     save('latest', it, psnr)
     if psnr > best_psnr:
         save('best', it, psnr)

@@ -10,10 +10,6 @@ def CreateDataset(opt):
     elif opt.dataset_mode == 'unaligned':
         from data.unaligned_dataset import UnalignedDataset
         dataset = UnalignedDataset()
-    elif opt.dataset_mode == 'single':
-        from data.single_dataset import SingleDataset
-        dataset = SingleDataset()
-        dataset.initialize(opt)
     else:
         raise ValueError("Dataset [%s] not recognized." % opt.dataset_mode)
 

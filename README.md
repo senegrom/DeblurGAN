@@ -42,10 +42,13 @@ Measured on the full GoPro test set (details and speed numbers in
 [SPEED.md](SPEED.md)): blurry input 25.6 dB, official DeblurGAN 27.3 dB,
 this fork's 2.84M grayscale student 29.1 dB (gray, real-time at 1080p),
 NAFNet-w64 33.1 dB via `--arch nafnet`.
-To test a model put your blurry images into a folder and run:
+To deblur a folder of images (the legacy `test.py` path has been removed):
 ```bash
-python test.py --dataroot /.path_to_your_data --model test --dataset_mode single --learn_residual
+python deblur_fast.py --input /path/to/blurry --output /path/to/out            # official DeblurGAN
+python deblur_fast.py --arch nafnet --input /path/to/blurry --output /path/to/out   # best quality
+python deblur_fast.py --arch student --input /path/to/blurry --output /path/to/out  # real-time grayscale
 ```
+See [SPEED.md](SPEED.md) for all options, benchmarks and training.
 ## Data
 Download dataset for Object Detection benchmark from [Google Drive](https://drive.google.com/file/d/1CPMBmRj-jBDO2ax4CxkBs9iczIFrs8VA/view?usp=sharing)
 

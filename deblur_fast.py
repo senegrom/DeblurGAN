@@ -47,8 +47,7 @@ from PIL import Image
 
 IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.webp', '.tif', '.tiff'}
 
-# ITU-R 601-2 luma, same coefficients PIL uses for convert('L')
-LUMA = (0.299, 0.587, 0.114)
+from deblur_utils import LUMA  # noqa: F401  (re-exported for callers)
 
 _REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -178,10 +177,18 @@ def _finalize(net, device, precision, channels_last, compile_model):
     if channels_last:
         net = net.to(memory_format=torch.channels_last)
     if compile_model:
+        # torch.compile never fails at wrap time; a missing Triton would only
+        # surface at the first forward, so probe availability up front.
         try:
+            from torch.utils._triton import has_triton
+            ok = has_triton()
+        except Exception:
+            ok = False
+        if ok and device.type == 'cuda':
             net = torch.compile(net, mode='max-autotune', dynamic=False)
-        except Exception as e:  # e.g. no Triton
-            print(f'[warn] torch.compile unavailable ({e}); running eager')
+        else:
+            print('[warn] --compile ignored: Triton not available for this '
+                  'device (pip install triton-windows); running eager')
     return net, dtype
 
 
@@ -411,6 +418,9 @@ def main():
                     help='deblurgan checkpoints trained without --learn_residual')
     ap.add_argument('--no-tlc', action='store_true',
                     help='nafnet: disable test-time local pooling (NAFNetLocal)')
+    ap.add_argument('--deterministic', action='store_true',
+                    help='bit-reproducible outputs (disables cuDNN autotune; '
+                         'slower). Default fp16 runs differ by ~1 LSB run-to-run')
     ap.add_argument('--batch', type=int, default=1,
                     help='batch size (same-size images are bucketed together)')
     ap.add_argument('--workers', type=int, default=4, help='data-loading workers')
@@ -432,7 +442,12 @@ def main():
         args.precision = 'fp16' if device.type == 'cuda' else 'fp32'
     if device.type == 'cpu' and args.precision == 'fp16':
         print('[warn] fp16 on CPU is slow; consider --precision fp32')
-    torch.backends.cudnn.benchmark = True
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.backends.cudnn.benchmark = True
     checkpoint = args.checkpoint or DEFAULT_CKPT[args.arch]
 
     # per-arch pipeline config
@@ -503,9 +518,10 @@ def main():
     dt = time.perf_counter() - t0
     prec = (f'autocast-{args.precision}' if ac_dtype is not None
             else args.precision)
+    compiled = hasattr(net, '_orig_mod')   # torch.compile wrapper present
     print(f'\ndone: {n_done} images in {dt:.2f}s ({n_done / dt:.2f} img/s) '
           f'[{args.arch}, {device.type}, {prec}'
-          f'{", gray" if args.gray else ""}{", compiled" if args.compile else ""}]')
+          f'{", gray" if args.gray else ""}{", compiled" if compiled else ""}]')
 
 
 if __name__ == '__main__':

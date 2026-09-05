@@ -48,7 +48,8 @@ python deblur_fast.py --input /path/to/blurry --output /path/to/out            #
 python deblur_fast.py --arch nafnet --input /path/to/blurry --output /path/to/out   # best quality
 python deblur_fast.py --arch student --input /path/to/blurry --output /path/to/out  # real-time grayscale
 ```
-See [SPEED.md](SPEED.md) for all options, benchmarks and training.
+See [SPEED.md](SPEED.md) for setup (`requirements.txt`, the NAFNet weight
+download), all options, benchmarks and training.
 ## Data
 Download dataset for Object Detection benchmark from [Google Drive](https://drive.google.com/file/d/1CPMBmRj-jBDO2ax4CxkBs9iczIFrs8VA/view?usp=sharing)
 

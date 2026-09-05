@@ -31,9 +31,20 @@ default. Reproduce: `python experiments/benchmark_all.py`. Paper reports
 
 ## Tutorial
 
-Python needs: `torch`/`torchvision` (cu130), `numpy`, `pillow`; `spandrel`
-(NAFNet), `triton-windows` (`--compile`), `lmdb` (benchmarks). All installed
-in `D:\PyEnv\torch`; `py` below means `D:\PyEnv\torch\Scripts\python.exe`.
+Setup (`py` below means `D:\PyEnv\torch\Scripts\python.exe`, a venv with
+everything already installed):
+
+```powershell
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
+py -m gdown 1S0PVRbyTakYY9a82kujgZLbMihfNBLfC -O checkpoints/NAFNet-GoPro-width64.pth   # NAFNet weights (272 MB, not in git)
+```
+
+The official DeblurGAN weights and both students ship in the repo
+(`checkpoints/official/`, `checkpoints/student*/`). GoPro train/test data for
+training and benchmarks: links in the
+[NAFNet GoPro docs](https://github.com/megvii-research/NAFNet/blob/main/docs/GoPro.md)
+(train zip -> `<data>/train/{input,target}`, test LMDBs -> `<data>/test/`).
 
 ### Deblur images
 

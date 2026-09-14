@@ -1,0 +1,44 @@
+name: CPU utility tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install tracked CPU test dependencies
+        run: python -m pip install -r requirements-ci.txt
+      - name: Check dependency consistency and CPU-only wheel
+        run: |
+          python -m pip check
+          python -c "import torch; assert torch.version.cuda is None, 'CI must use a CPU-only wheel'"
+      - name: Compile the utility and its regression tests
+        run: python -m compileall -q deblur_utils.py tests/test_cpu_utils.py
+      - name: Run synthetic utility regressions
+        run: python -m unittest discover -s tests -p test_cpu_utils.py -v
+      # This is intentionally not GPU training, model inference, checkpoint
+      # loading, dataset evaluation, or validation of legacy training scripts.

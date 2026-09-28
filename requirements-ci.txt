@@ -1,6 +1,6 @@
 # Direct dependencies for synthetic CPU utility tests, not a training environment.
 # The +cpu build excludes CUDA wheels. Transitive dependencies are resolved by pip.
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.13.0+cpu
-numpy==2.5.2
+torch==2.14.0+cpu
+numpy==2.5.3
 Pillow==12.3.0
